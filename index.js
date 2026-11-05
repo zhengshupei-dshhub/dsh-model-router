@@ -12,7 +12,7 @@ export const inject = ['sessionController']
 
 const DEFAULTS = {
   enabled: true,
-  default: { provider: 'ark-agent-plan', model: 'doubao-seed-2-0-pro-260215' },
+  default: { provider: 'ark-agent-plan', model: 'deepseek-v4-flash-260801' },   // 1M 上下文，系数 0.5
   // 长文本阈值：超过这个字符数优先上 1M 上下文的模型
   longTextChars: 20000,
   rules: [
@@ -20,7 +20,7 @@ const DEFAULTS = {
       id: 'light',
       match: ['格式转换', '提取', '分类', '重命名', '列一下', '改写标题', '简单问题'],
       provider: 'ark-agent-plan',
-      model: 'doubao-seed-2-0-mini-260428',
+      model: 'deepseek-v4-flash-260801',
     },
     {
       id: 'long-doc',
@@ -32,13 +32,13 @@ const DEFAULTS = {
       id: 'writing',
       match: ['文案', '剧本', '故事', '润色', '写一篇', '创作', '标题党'],
       provider: 'ark-agent-plan',
-      model: 'doubao-seed-2-1-pro-260915',
+      model: 'deepseek-v4-1-flash-261017',
     },
     {
       id: 'code',
       match: ['重构', '调试', '报错', 'bug', '函数', '接口', '测试', '部署', '脚本', '代码'],
       provider: 'ark-agent-plan',
-      model: 'doubao-seed-2-1-pro-260915',
+      model: 'deepseek-v4-1-flash-261017',
     },
   ],
 }
@@ -74,7 +74,7 @@ export function pickModel(text, config = {}) {
   if (attachments > 0) {
     return {
       provider: merged.vision?.provider ?? 'ark-agent-plan',
-      model: merged.vision?.model ?? 'doubao-seed-2-1-pro-260915',
+      model: merged.vision?.model ?? 'kimi-k3-1-pro-261001',
       rule: 'attachment',
     }
   }

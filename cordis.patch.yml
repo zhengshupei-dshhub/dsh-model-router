@@ -3,24 +3,5 @@
       name: '@local/dsh-model-router'
       config:
         enabled: true
-        # 白名单内的模型（都在 ark-agent-plan / 免费包里，不扣账户余额）
-        default:
-          provider: ark-agent-plan
-          model: doubao-seed-2-0-pro-260215   # 系数 1.0，最强且最便宜
-        rules:
-          - id: light
-            match: ['格式转换', '提取', '分类', '重命名', '列一下', '改写标题', '简单问题']
-            provider: ark-agent-plan
-            model: doubao-seed-2-0-mini-260428   # 系数 0.25
-          - id: long-doc
-            match: ['长文档', '通读', '整篇', '论文', 'PDF', '翻译整篇', '代码库', '大文件']
-            provider: ark-agent-plan
-            model: kimi-k3-1-pro-261001          # 1M 上下文
-          - id: writing
-            match: ['文案', '剧本', '故事', '润色', '写一篇', '创作', '标题党']
-            provider: ark-agent-plan
-            model: doubao-seed-2-1-pro-260915
-          - id: code
-            match: ['重构', '调试', '报错', 'bug', '函数', '接口', '测试', '部署', '脚本', '代码']
-            provider: ark-agent-plan
-            model: doubao-seed-2-1-pro-260915
+        # 全部走 1M 上下文模型，避免会话变长后再次 400。
+        # 具体规则在 index.js 的 DEFAULTS 里；要临时改模型就直接改那份表。
