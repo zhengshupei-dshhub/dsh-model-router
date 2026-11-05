@@ -1,10 +1,14 @@
 /**
- * 开局选模型：新会话的第一条用户消息里判断任务类型，
- * 然后用 sessionController.selectModel 把这个会话的模型切到白名单里最合适的一个。
+ * 开局选模型：按用户消息的关键词，把当前会话切到套餐里最合适的模型。
+ *
+ * 2026-11-05 重写：Agent Plan 改用官方 `arkcli helper` 接入，
+ * provider 变成 `arkcli-agent-plan`，模型是公开短名（doubao-seed-2.1-pro 等），
+ * 不再是之前手配的版本号 id。
  *
  * 设计取舍：
- * - 只在「每个会话的第一条消息」做一次，之后不干预（避免打断用户手动选择）；
  * - 纯关键词匹配，不发额外的分类请求（零成本、零延迟）；
+ * - 每轮都判断（perTurn），但目标没变就不写；
+ * - 套餐 5 小时额度接近上限时，按 WorkBuddy → DeepSeek 账号 → 不动 降级；
  * - 任何一步失败都只写日志，不影响正常对话。
  */
 
@@ -22,93 +26,82 @@ function readSnapshot() {
   }
 }
 
-const DEFAULTS = {
+const PROVIDER = 'arkcli-agent-plan'
+
+export const DEFAULTS = {
   enabled: true,
-  // 是否每一轮用户消息都重新选模型（默认只在会话第一轮选一次）
-  perTurn: false,
-  // 免费包用尽后的降级顺序：先用套餐（订阅额度），再退 WorkBuddy（积分），都没有就不切
-  planFallback: { provider: 'ark-agent-plan', model: 'deepseek-v4-flash-260801' },
-  workbuddyFallback: { provider: 'workbuddy', model: 'hy3' },
-  // 小上下文模型（WorkBuddy hy3）只允许在前几轮用；长会话一律绕开
-  workbuddyMaxTurn: 5,
-  // 套餐 5 小时窗口用到这个百分比就算「不可用」
+  // 每轮用户消息都重新判断（目标没变不写）
+  perTurn: true,
+  // 套餐 5 小时窗口用到这个百分比就算「不可用」，开始降级
   planCeilingPercent: 95,
-  // WorkBuddy 积分低于这个值就不再往那切
+  // 降级第二档：WorkBuddy（积分制），hy3 上下文小，只在前几轮用
+  workbuddyFallback: { provider: 'workbuddy', model: 'hy3' },
+  workbuddyMaxTurn: 5,
   workbuddyMinCredits: 50,
-  // 最后一档：按 token 计费的 DeepSeek 账号
+  // 降级第三档：按 token 计费的 DeepSeek 账号
   deepseekFallback: { provider: 'deepseek-account', model: 'deepseek-flash' },
-  // 免费包端点因平台密钥失效停用（2026-11-05），套餐满时直接降到 WorkBuddy
-  packToPlan: {},
-  planToPack: {},
-  default: { provider: 'ark-agent-plan', model: 'deepseek-v4-flash-260801' },
+  // 超过这个字符数直接上 1M 上下文的模型
   longTextChars: 20000,
+  default: { provider: PROVIDER, model: 'doubao-seed-2.1-pro' },
+  vision: { provider: PROVIDER, model: 'kimi-k3.1-pro' },
   rules: [
-    // 1) 硬推理：数学 / 算法 / 证明 / 复杂逻辑
+    // 1) 硬推理：数学 / 算法 / 证明
     {
       id: 'reasoning',
       match: ['数学', '算法', '证明', '证一下', '推导', '不等式', '逻辑证明', '复杂度', '最优解', '递推', '方程', '归纳法'],
-      provider: 'ark-agent-plan',
-      model: 'deepseek-v4-flash-260801',
+      provider: PROVIDER,
+      model: 'deepseek-v4-pro',
     },
     // 2) 单文件小改 / 补测试 / 样板代码
     {
       id: 'code-small',
       match: ['单文件', '小改', '补测试', '改个 bug', '修一个小 bug', '补个函数', '写个脚本', '样板', '改一下'],
-      provider: 'ark-agent-plan',
-      model: 'deepseek-v4-flash-260801',
+      provider: PROVIDER,
+      model: 'deepseek-v4.1-flash',
     },
-    // 3) 跨文件重构、架构设计、疑难 bug
+    // 3) 跨文件重构 / 架构 / 疑难 bug
     {
       id: 'code',
       match: ['重构', '架构', '疑难', '调试', '报错', '多文件', '跨文件', '整个项目', '依赖冲突', '设计模式'],
-      provider: 'ark-agent-plan',
-      model: 'kimi-k3-260701',
+      provider: PROVIDER,
+      model: 'kimi-k3.1-pro',
     },
     // 4) 代码审查 / 独立调查
     {
       id: 'review',
       match: ['审查', 'review', '排查', '调查', '审计', '评审', '检查一下'],
-      provider: 'ark-agent-plan',
-      model: 'kimi-k3-260701',
+      provider: PROVIDER,
+      model: 'kimi-k3.1-pro',
     },
     // 5) 长文档 / 论文 / 大代码库通读
     {
       id: 'long-doc',
       match: ['长文档', '通读', '整篇', '论文', 'pdf', '翻译整篇', '代码库', '大文件', '整本书', '全文'],
-      provider: 'ark-agent-plan',
-      model: 'kimi-k3-260701',
+      provider: PROVIDER,
+      model: 'kimi-k3.1-pro',
     },
     // 6) 看图 / 截图 / 视频理解
     {
       id: 'vision',
       match: ['截图', '看图', '图片', '照片', '这张图', '视频里', '识别一下', 'ocr', '这张'],
-      provider: 'ark-agent-plan',
-      model: 'kimi-k3-260701',
+      provider: PROVIDER,
+      model: 'kimi-k3.1-pro',
     },
-    // 7) 中文文案 / 剧本 / 创意写作 —— GLM（订阅制，不另计费）
+    // 7) 中文文案 / 剧本 / 创意写作
     {
       id: 'writing',
       match: ['文案', '剧本', '故事', '润色', '写一篇', '创作', '标题党', '小红书', '公众号', '口播'],
-      provider: 'ark-agent-plan',
-      model: 'glm-5-3-260801',
+      provider: PROVIDER,
+      model: 'glm-5.3',
     },
-    // 8) 格式转换 / 抽取 / 分类 / 批量改写 —— 优先 WorkBuddy 免费模型（0 积分）
+    // 8) 格式转换 / 抽取 / 分类 / 批量改写
     {
       id: 'light',
       match: ['格式转换', '提取', '分类', '重命名', '列一下', '改写标题', '批量', '转成', 'json', 'csv', '表格'],
-      provider: 'ark-agent-plan',
-      model: 'deepseek-v4-flash-260801',
+      provider: PROVIDER,
+      model: 'deepseek-v4.1-flash-economy',
     },
   ],
-}
-
-
-/** 读 quota-guard 落下的余量快照，返回某模型剩余百分比；读不到返回 undefined。 */
-export function packCoverage(model, snapshot) {
-  const packs = snapshot?.packs
-  if (!Array.isArray(packs)) return undefined
-  const hit = packs.find((p) => p.model === model || model.startsWith(p.model) || p.model.startsWith(model))
-  return hit?.percent
 }
 
 /** 从 UserMessage 的 content 里拼出纯文本，并报告是否带了图片/文件附件。 */
@@ -130,21 +123,13 @@ export function pickModel(text, config = {}) {
   const attachments = Number(config.attachments ?? 0)
   const longTextChars = Number(merged.longTextChars ?? DEFAULTS.longTextChars)
 
-  // 前置判断一：超长文本优先 1M 上下文的模型，避免中途被截断。
-  if (source.length > longTextChars) {
-    return {
-      provider: merged.longDoc?.provider ?? 'ark-agent-plan',
-      model: merged.longDoc?.model ?? 'kimi-k3-1-pro-261001',
-      rule: 'long-text',
-    }
-  }
-  // 前置判断二：带图片/文件时用视觉模型（默认模型本身支持图，这里显式点出来）。
+  // 带图片/文件：用支持视觉的模型
   if (attachments > 0) {
-    return {
-      provider: merged.vision?.provider ?? 'ark-agent-plan',
-      model: merged.vision?.model ?? 'kimi-k3-1-pro-261001',
-      rule: 'attachment',
-    }
+    return { ...merged.vision, rule: 'attachment' }
+  }
+  // 超长文本：用 1M 上下文的模型
+  if (source.length > longTextChars) {
+    return { ...merged.vision, rule: 'long-text' }
   }
   for (const rule of merged.rules ?? []) {
     const hit = (rule.match ?? []).some((keyword) => keyword && source.includes(String(keyword).toLowerCase()))
@@ -159,64 +144,37 @@ export function apply(ctx, config = {}) {
   const merged = { ...DEFAULTS, ...config }
   if (!merged.enabled) return
 
-  // 每个会话只路由一次；进程重启后重新计。
-  const routed = new Set()
   const logger = ctx.logger?.('dsh-model-router')
-
-  // 2026-11-05 修正：原来监听 session/event，把「插件加载后的第一条消息」当成
-  // 「新会话的第一条消息」，结果把一条几十万 token 的老会话切到了 256k 上下文
-  // 的模型上，直接 400（image+text exceed max message tokens）。
-  // 现在只认 agent/inbox/claimed 且 turn === 1 —— 真正的会话第一轮。
-  // 每个会话上一次选中的模型，用于「目标没变就不写」的节流。
   const lastChoice = new Map()
 
   ctx.on('agent/inbox/claimed', (payload) => {
     const turn = payload?.turn ?? 0
-    // 默认只认第一轮；打开 perTurn 后每一轮都判断。
     if (turn !== 1 && !merged.perTurn) return
     const sessionId =
       payload?.agent?.session?.id ??
       payload?.agent?.session?.header?.id ??
       payload?.agent?.sessionId
     if (!sessionId) return
-    // 首轮模式：每个会话只路由一次；perTurn 模式：只要目标模型没变就不重复写。
-    if (!merged.perTurn && routed.has(sessionId)) return
-    routed.add(sessionId)
-    const event = { data: payload?.message }
 
-    const { text, attachments } = textOf(event.data ?? payload?.message)
+    const { text, attachments } = textOf(payload?.message)
     const choice = pickModel(text, { ...merged, attachments })
-    // ── 套餐优先：额度足就走套餐；不足依次降级 免费包 → WorkBuddy → DeepSeek → 不动
+
     const snap = readSnapshot()
     const fiveHour = (snap?.planPeriods ?? []).find((p) => p.label === '5h')
     const planOk = fiveHour ? fiveHour.percent < (merged.planCeilingPercent ?? 95) : true
     const credits = snap?.workbuddyCredits
     const creditsOk = typeof credits === 'number' ? credits >= (merged.workbuddyMinCredits ?? 50) : true
-    const canUseWorkbuddy = (payload?.turn ?? 0) <= (merged.workbuddyMaxTurn ?? 5)
+    const canUseWorkbuddy = turn <= (merged.workbuddyMaxTurn ?? 5)
 
-    // WorkBuddy 目标：长会话一律绕开（hy3 上下文小）。
-    if (choice.provider === 'workbuddy' && !canUseWorkbuddy) {
-      choice.provider = 'ark-agent-plan'
-      choice.model = 'deepseek-v4-flash-260801'
-      choice.rule = `${choice.rule}-long-session→plan`
-    }
-
-    // 套餐目标：额度不足时看包。
-    if (choice.provider === 'ark-agent-plan' && !planOk) {
-      const alt = merged.planToPack?.[choice.model]
-      const cov = alt ? packCoverage(alt, snap) : undefined
-      if (alt && !snap?.packBlocked && (cov === undefined || cov > 0)) {
-        logger?.warn?.(`套餐 5h 已用 ${fiveHour?.percent ?? '?'}%，${choice.model} → 免费包 ${alt}`)
-        choice.provider = 'ark-free-pack'
-        choice.model = alt
-        choice.rule = `${choice.rule}-plan-full→pack`
-      } else if (canUseWorkbuddy && creditsOk) {
-        logger?.warn?.('套餐满且包不可用，降到 WorkBuddy')
+    // 套餐额度不够：WorkBuddy → DeepSeek 账号 → 不动
+    if (choice.provider === PROVIDER && !planOk) {
+      if (canUseWorkbuddy && creditsOk) {
+        logger?.warn?.(`套餐 5h 已用 ${fiveHour?.percent ?? '?'}%，降级到 WorkBuddy`)
         choice.provider = merged.workbuddyFallback.provider
         choice.model = merged.workbuddyFallback.model
         choice.rule = `${choice.rule}-plan-full→workbuddy`
       } else if (merged.deepseekFallback?.provider) {
-        logger?.warn?.('套餐满、包与 WorkBuddy 都不可用，最后走 DeepSeek 账号（按 token 计费）')
+        logger?.warn?.('套餐满、WorkBuddy 不可用，最后走 DeepSeek 账号（按 token 计费）')
         choice.provider = merged.deepseekFallback.provider
         choice.model = merged.deepseekFallback.model
         choice.rule = `${choice.rule}-plan-full→deepseek`
@@ -226,49 +184,21 @@ export function apply(ctx, config = {}) {
       }
     }
 
-    // 免费包目标：包无余量或被拦时反向找套餐。
-    if (choice.provider === 'ark-free-pack') {
-      const cov = packCoverage(choice.model, snap)
-      const blocked = Boolean(snap?.packBlocked)
-      if (blocked || (cov !== undefined && cov <= 0)) {
-        const alt = merged.packToPlan?.[choice.model]
-        if (alt && planOk) {
-          logger?.warn?.(`免费包 ${choice.model} ${blocked ? '被拦' : '无余量'} → 套餐 ${alt}`)
-          choice.provider = 'ark-agent-plan'
-          choice.model = alt
-          choice.rule = `${choice.rule}-pack-out→plan`
-        } else if (canUseWorkbuddy && creditsOk) {
-          logger?.warn?.(`免费包 ${choice.model} 不可用，降到 WorkBuddy`)
-          choice.provider = merged.workbuddyFallback.provider
-          choice.model = merged.workbuddyFallback.model
-          choice.rule = `${choice.rule}-pack-out→workbuddy`
-        } else if (merged.deepseekFallback?.provider) {
-          logger?.warn?.('包不可用且套餐也满，最后走 DeepSeek 账号')
-          choice.provider = merged.deepseekFallback.provider
-          choice.model = merged.deepseekFallback.model
-          choice.rule = `${choice.rule}-pack-out→deepseek`
-        } else {
-          return
-        }
-      }
+    // WorkBuddy 目标：长会话一律绕开（hy3 上下文很小，会把长会话撑爆）
+    if (choice.provider === 'workbuddy' && !canUseWorkbuddy) {
+      choice.provider = PROVIDER
+      choice.model = merged.default.model
+      choice.rule = `${choice.rule}-long-session→plan`
     }
-    logger?.info?.(`开局选模型：session=${sessionId} rule=${choice.rule} → ${choice.provider}/${choice.model}`)
 
-    // 目标模型没变就不打扰（尤其 perTurn 模式下，省掉重复写入）。
-    if (lastChoice.get(sessionId) === choice.model) return
-    lastChoice.set(sessionId, choice.model)
+    logger?.info?.(`选模型：session=${sessionId} turn=${turn} rule=${choice.rule} → ${choice.provider}/${choice.model}`)
+
+    // 目标模型没变就不写
+    if (lastChoice.get(sessionId) === `${choice.provider}/${choice.model}`) return
+    lastChoice.set(sessionId, `${choice.provider}/${choice.model}`)
 
     Promise.resolve()
-      .then(() =>
-        ctx.sessionController.selectModel({
-          sessionId,
-          provider: choice.provider,
-          model: choice.model,
-        }),
-      )
-      .catch((error) => {
-        // 选模型失败不影响对话本身。
-        logger?.warn?.(`开局选模型失败：${error?.message ?? error}`)
-      })
+      .then(() => ctx.sessionController.selectModel({ sessionId, provider: choice.provider, model: choice.model }))
+      .catch((error) => logger?.warn?.(`选模型失败：${error?.message ?? error}`))
   })
 }
