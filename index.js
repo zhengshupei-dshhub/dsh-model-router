@@ -15,7 +15,7 @@ const DEFAULTS = {
   // 是否每一轮用户消息都重新选模型（默认只在会话第一轮选一次）
   perTurn: false,
   // 兜底：1M 上下文里最便宜的 deepseek-v4-flash（系数 0.5）
-  default: { provider: 'ark-agent-plan', model: 'deepseek-v4-flash-260801' },
+  default: { provider: 'workbuddy', model: 'hy3' },
   longTextChars: 20000,
   rules: [
     // 1) 硬推理：数学 / 算法 / 证明 / 复杂逻辑
@@ -67,12 +67,12 @@ const DEFAULTS = {
       provider: 'ark-agent-plan',
       model: 'glm-5-3-260801',
     },
-    // 8) 格式转换 / 抽取 / 分类 / 批量改写
+    // 8) 格式转换 / 抽取 / 分类 / 批量改写 —— 优先 WorkBuddy 免费模型（0 积分）
     {
       id: 'light',
       match: ['格式转换', '提取', '分类', '重命名', '列一下', '改写标题', '批量', '转成', 'json', 'csv', '表格'],
-      provider: 'ark-agent-plan',
-      model: 'deepseek-v4-flash-260801',
+      provider: 'workbuddy',
+      model: 'hy3',
     },
   ],
 }
