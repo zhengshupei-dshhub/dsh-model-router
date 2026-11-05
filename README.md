@@ -7,14 +7,20 @@
 ## 它做什么
 
 ```
+插件启动 ──扫描运行时所有 provider 与模型──> 按名字/模态识别能力（vision/code/pro…）
 你的消息 ──关键词匹配──> 任务类型 ──> sessionController.selectModel(...)
                                         └─> 该会话切模型，界面标签同步变
 ```
 
-- 默认**每轮都判断**，但目标模型没变就不写，不打扰你手动选择；
+**零配置即可用**：不管你接的是火山 Agent Plan、Coding Plan，还是 OpenAI、Anthropic、自建
+OpenAI 兼容端点，插件启动时会自动列出全部 provider 的模型，按 id/名字和上报的输入模态
+判断每个模型适合干什么（带 image 模态或名字带 vision/vl → 看图；带 mini/lite/flash →
+轻量；带 code/codex → 写代码；带 pro/max/ultra → 复杂任务），并据此建立映射。
+
+- 默认每轮都判断，但目标模型没变就不写，不打扰你的手动选择；
 - 带图片/附件 → 视觉模型；超长文本（默认 2 万字以上）→ 长上下文模型；
-- 套餐额度接近上限时按「WorkBuddy → 兜底 provider → 不动」降级；
-- 套餐请求报错（订阅抖动 / 5xx / 429）时，自动切到兜底 provider 并重试同一轮。
+- 额度接近上限时按配置的降级链处理（默认只有“保持不动”，需要才加）；
+- 主 provider 请求报错（订阅抖动 / 5xx / 429）时，配了 fallback 才兜底重试。
 
 ## 安装
 
@@ -31,80 +37,81 @@ git clone https://github.com/zhengshupei-dshhub/dsh-model-router.git
 
 ## 配置
 
-### Agent Plan（默认，本仓库作者的环境）
+### 默认：什么都不写
 
-用 `arkcli helper` 接好后，provider 叫 `arkcli-agent-plan`，默认配置直接可用：
+装好插件、重启即可。自动识别的结果会写在日志里（`已识别 N 个模型：default=…, code=…`）。
+
+### 固定到某个 provider
 
 ```yaml
 - id: model-router
   config:
-    provider: arkcli-agent-plan
+    provider: arkcli-coding-plan   # 不自动探测，只用这个 provider
 ```
 
-### Coding Plan / 其他火山套餐
-
-模型名基本一致，只改 provider：
+### 精确指定模型（其他厂商 / 自建端点）
 
 ```yaml
 - id: model-router
   config:
-    provider: arkcli-coding-plan   # 换成你实际注册的 provider id
-```
-
-### 其他厂商（OpenAI / Anthropic / 自建端点）
-
-把模型名换成你那边的 id 即可，provider 用 DSH 里注册的那个：
-
-```yaml
-- id: model-router
-  config:
-    provider: my-openai
     models:
-      default: gpt-5.6
-      reasoning: o5
-      code: gpt-5.6-codex
-      codeSmall: gpt-5.6-mini
-      review: gpt-5.6
-      longDoc: gpt-5.6
-      vision: gpt-5.6-vision
-      writing: gpt-5.6
-      light: gpt-5.6-mini
-    fallback: null            # 不需要兜底就设成 null
-    workbuddyFallback: null   # 没装 WorkBuddy 插件也设成 null
+      default: { provider: my-openai, model: gpt-5.6 }
+      reasoning: { provider: my-openai, model: o5 }
+      code: { provider: my-openai, model: gpt-5.6-codex }
+      codeSmall: { provider: my-openai, model: gpt-5.6-mini }
+      review: { provider: my-openai, model: gpt-5.6 }
+      longDoc: { provider: my-openai, model: gpt-5.6 }
+      vision: { provider: my-openai, model: gpt-5.6-vision }
+      writing: { provider: my-openai, model: gpt-5.6 }
+      light: { provider: my-openai, model: gpt-5.6-mini }
+```
+
+显式配置只覆盖对应键，其余仍自动识别。
+
+### 需要按量兜底 / WorkBuddy 降级时
+
+默认两项都关闭（`fallback: null`、`workbuddyFallback: null`），需要才配：
+
+```yaml
+- id: model-router
+  config:
+    fallback: { provider: my-paid-provider, model: my-model }
+    fallbackOnError: true
+    workbuddyFallback: { provider: workbuddy, model: hy3 }
 ```
 
 ### 完整可配置项
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
-| `provider` | `arkcli-agent-plan` | 主 provider id |
-| `autoDetectProvider` | `true` | 配置的 provider 不存在时，自动找能提供同名模型的 provider |
+| `provider` | `auto` | `auto` 自动探测；写死 provider id 则只用它 |
+| `models` | `{}` | 显式「键 → { provider, model }」，覆盖自动识别 |
+| `autoDetectProvider` | `true` | 是否扫描运行时模型目录 |
 | `perTurn` | `true` | 每轮都判断（false = 只在会话第一轮） |
-| `models` | 见下 | 任务类型 → 模型 id 映射 |
 | `rules` | 中文关键词表 | 关键词 → 任务类型 |
-| `longTextChars` | `20000` | 超过这个字符数走 `longDoc` 模型 |
-| `planCeilingPercent` | `95` | 套餐 5 小时用量超过它就开始降级 |
+| `longTextChars` | `20000` | 超过这个字符数走 `longDoc` |
+| `planCeilingPercent` | `95` | 快照里 5h 用量超过它才开始降级 |
 | `snapshotStaleMinutes` | `60` | 余量快照超过这么久没更新就按「可用」处理 |
-| `fallback` | `deepseek-account/deepseek-flash` | 失败兜底与额度兜底的目标 |
-| `fallbackOnError` | `true` | 套餐报错时是否自动兜底重试 |
+| `fallback` | `null` | 失败/额度兜底的目标；不想要就保持 null |
+| `fallbackOnError` | `true` | 请求报错时是否自动兜底重试（fallback 非 null 才生效） |
 | `fallbackErrorPattern` | `InvalidSubscription\|InternalServiceError\|5\d\d\|429\|ServiceUnavailable` | 命中才兜底 |
-| `workbuddyFallback` | `workbuddy/hy3` | 额度不足时的中间档（积分制） |
-| `workbuddyMaxTurn` | `5` | WorkBuddy 只在前几轮用（hy3 上下文小） |
-| `workbuddyMinCredits` | `50` | 积分低于此值不再往 WorkBuddy 切 |
+| `workbuddyFallback` | `null` | 额度不足时的积分降级档 |
+| `workbuddyMaxTurn` | `5` | 积分档只在前几轮用（小上下文模型） |
+| `workbuddyMinCredits` | `50` | 积分低于此值不再往那切 |
 
-### 默认模型映射
+### 能力键与识别提示
 
-| 键 | 默认模型 | 触发场景 |
-|---|---|---|
-| `default` | `doubao-seed-2.1-pro` | 兜底 |
-| `reasoning` | `deepseek-v4-pro` | 数学/算法/证明 |
-| `code` | `kimi-k3.1-pro` | 重构/调试/跨文件 |
-| `codeSmall` | `deepseek-v4.1-flash` | 单文件小改/补测试 |
-| `review` | `kimi-k3.1-pro` | 审查/排查/审计 |
-| `longDoc` | `kimi-k3.1-pro` | 长文档/论文/代码库 |
-| `vision` | `kimi-k3.1-pro` | 截图/图片/视频 |
-| `writing` | `glm-5.3` | 文案/剧本/润色 |
-| `light` | `deepseek-v4.1-flash-economy` | 格式转换/提取/分类 |
+自动识别时，每个键按如下顺序找：名字命中提示词 → 上级键兜底 → default：
+
+| 键 | 名字提示（节选） |
+|---|---|
+| `vision` | 模型上报 image 模态；或名字含 `vision` / `-vl` / `vlm` |
+| `light` / `codeSmall` | `mini` / `lite` / `flash` / `nano` |
+| `code` / `review` | `code` / `codex` / `pro` |
+| `longDoc` | `pro` / `max` / `ultra` |
+| `reasoning` | `o1` / `o3` / `r1` / `reason` / `pro` |
+| `writing` | `glm` / `gpt` / `claude` / `gemini` / `pro` |
+| `default` | `pro` / `max` / 目录第一个 |
 
 ## 关键词规则
 

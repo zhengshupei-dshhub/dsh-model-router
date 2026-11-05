@@ -1,13 +1,12 @@
 /**
  * 开局选模型：按用户消息的关键词，把当前会话切到最合适的模型。
  *
- * 通用性设计（2026-11-05 v2.2.0）：
- * - provider / 模型名全部来自配置，默认值是我们这套 Agent Plan（arkcli-agent-plan）；
- * - 别人用 Coding Plan、OpenAI、Anthropic 或自建端点，只改 config 里的 provider 和 models；
- * - 配置里没写、但运行时注册了别的 provider 时，会自动找一个能提供同名模型的 provider；
- * - 多出来的两档降级（WorkBuddy / DeepSeek 账号）也可以关掉，只留套餐。
+ * 通用性设计（v2.3.0）：
+ * - 默认零配置：扫描运行时注册的所有 provider 与模型，按名字/模态自动识别能力；
+ * - 显式配置（provider / models）始终优先，用来微调；
+ * - 换 provider、换套餐、换厂商都不用改代码。
  *
- * 匹配逻辑：纯关键词，不发额外请求，零成本、零延迟。
+ * 匹配逻辑：纯关键词，不发额外请求，零延迟、零成本。
  */
 
 import { spawn } from 'node:child_process'
@@ -16,6 +15,14 @@ import os from 'node:os'
 import path from 'node:path'
 
 export const inject = ['sessionController']
+
+/**
+ * @typedef {Object} CatalogEntry
+ * @property {string} provider
+ * @property {string} id
+ * @property {string} name
+ * @property {string[]} modalities
+ */
 
 function readSnapshot() {
   const file = path.join(os.homedir(), '.dsh', 'quota-snapshot.json')
@@ -46,42 +53,28 @@ function refreshSnapshotInBackground(logger) {
 
 export const DEFAULTS = {
   enabled: true,
-  // 主 provider：换套餐就改这里（Coding Plan 一般是 arkcli-coding-plan）
-  provider: 'arkcli-agent-plan',
-  // provider 不匹配时，是否自动找一个能提供同名模型的 provider
-  autoDetectProvider: true,
+  // 'auto' = 扫描运行时的所有 provider 自动分配；也可以写死 provider id
+  provider: 'auto',
+  // 显式模型映射（键 → { provider, model }）；空对象 = 全部自动识别
+  models: {},
   // 每轮用户消息都重新判断（目标没变不写）
   perTurn: true,
   // 超过这么多字符的输入直接上「长文本」模型
   longTextChars: 20000,
   // 套餐 5 小时窗口用到这个百分比就算「不可用」，开始降级
   planCeilingPercent: 95,
-  // 包/套餐快照超过这么多分钟没更新就视为「未知」，按可用处理（宁可 429 也不误扣费）
+  // 快照超过这么多分钟没更新就视为「未知」，按可用处理（宁可 429 也不误扣费）
   snapshotStaleMinutes: 60,
-  // 失败兜底：套餐请求报错时切到 fallback 并重试同一轮
+  // 失败兜底：主 provider 请求报错时切到 fallback 并重试；不需要就设成 null
   fallbackOnError: true,
   fallbackErrorPattern: 'InvalidSubscription|InternalServiceError|5\\d\\d|429|ServiceUnavailable',
-  // 兜底目标（按需改；不想要按量计费就把 fallback 设为 null）
-  fallback: { provider: 'deepseek-account', model: 'deepseek-flash' },
-  // 额度不足时的降级链：workbuddy（积分）→ fallback（上面那个）
-  workbuddyFallback: { provider: 'workbuddy', model: 'hy3' },
+  fallback: null,
+  // 额度不足时的中间降级（按积分计费，没有对应插件就设成 null）
+  workbuddyFallback: null,
   workbuddyMaxTurn: 5,
   workbuddyMinCredits: 50,
 
-  // ── 模型映射：别人换 provider 时主要改这里 ──
-  models: {
-    default: 'doubao-seed-2.1-pro',
-    reasoning: 'deepseek-v4-pro',
-    code: 'kimi-k3.1-pro',
-    codeSmall: 'deepseek-v4.1-flash',
-    review: 'kimi-k3.1-pro',
-    longDoc: 'kimi-k3.1-pro',
-    vision: 'kimi-k3.1-pro',
-    writing: 'glm-5.3',
-    light: 'deepseek-v4.1-flash-economy',
-  },
-
-  // 关键词规则：target 指向上面 models 里的键
+  // 关键词规则：target 是模型映射里的键
   rules: [
     {
       id: 'reasoning',
@@ -126,6 +119,72 @@ export const DEFAULTS = {
   ],
 }
 
+/** 模型映射的键（自动识别时每个键都要有候选）。 */
+export const CAPABILITY_KEYS = [
+  'default', 'reasoning', 'code', 'codeSmall', 'review', 'longDoc', 'vision', 'writing', 'light',
+]
+
+const NAME_HINTS = {
+  light: ['mini', 'lite', 'flash-economy', 'nano', 'small'],
+  codeSmall: ['mini', 'lite', 'flash', 'small'],
+  code: ['code', 'codex', 'coder', 'pro'],
+  review: ['pro', 'code', 'max'],
+  longDoc: ['pro', 'max', 'ultra'],
+  reasoning: ['o1', 'o3', 'r1', 'reason', 'think', 'pro', 'max'],
+  writing: ['glm', 'gpt', 'claude', 'pro', 'gemini'],
+  vision: ['vision', '-vl', 'vl-', 'vlm', 'image', 'multimodal'],
+}
+
+/** 名字里是否出现任一关键词。 */
+function matchesName(entry, words) {
+  const name = `${entry.id} ${entry.name}`.toLowerCase()
+  return words.some((word) => name.includes(word.toLowerCase()))
+}
+
+function isMultimodal(entry) {
+  if ((entry.modalities ?? []).some((modality) => modality === 'image')) return true
+  return matchesName(entry, NAME_HINTS.vision)
+}
+
+/**
+ * 从运行时模型目录自动识别「能力 → 模型」映射。纯函数，便于测试。
+ * @param {CatalogEntry[]} catalog
+ * @returns {Record<string, { provider: string, model: string }>}
+ */
+export function discoverModelMap(catalog) {
+  const list = Array.isArray(catalog) ? catalog : []
+  if (!list.length) return {}
+
+  const findByName = (words) => list.find((entry) => matchesName(entry, words))
+  const map = {}
+  const assign = (key, entry) => {
+    if (entry && !map[key]) map[key] = { provider: entry.provider, model: entry.id }
+  }
+
+  // 视觉：优先用显式标注 image 的，其次名字带 vision/vl 的
+  assign('vision', list.find(isMultimodal))
+
+  // 轻量/小改：名字带 mini/lite/flash 的
+  assign('light', findByName(NAME_HINTS.light))
+  assign('codeSmall', findByName(NAME_HINTS.codeSmall))
+
+  // 代码/审查/长文/推理/写作：按各自提示词找，失败时逐级兜底
+  assign('code', findByName(NAME_HINTS.code))
+  assign('review', findByName(NAME_HINTS.review))
+  assign('longDoc', findByName(NAME_HINTS.longDoc))
+  assign('reasoning', findByName(NAME_HINTS.reasoning))
+  assign('writing', findByName(NAME_HINTS.writing))
+
+  // default：优先 pro，其次第一个
+  assign('default', findByName(['pro', 'max', 'ultra']) ?? list[0])
+
+  // 还缺的键全部用 default，保证每个 target 都能解析
+  for (const key of CAPABILITY_KEYS) {
+    if (!map[key]) map[key] = map.default
+  }
+  return map
+}
+
 /** 从 UserMessage 的 content 里拼出纯文本，并报告是否带了图片/文件附件。 */
 export function textOf(message) {
   const blocks = Array.isArray(message?.content) ? message.content : []
@@ -140,66 +199,78 @@ export function textOf(message) {
 
 /**
  * 选出目标模型。纯函数，便于测试。
- * 返回 { provider, model, rule }；provider 取配置值。
+ * resolvedMap：已识别（或显式提供）的「键 → { provider, model }」。
  */
-export function pickModel(text, config = {}) {
-  const merged = { ...DEFAULTS, ...config, models: { ...DEFAULTS.models, ...(config.models ?? {}) } }
+export function pickModel(text, config = {}, resolvedMap = {}) {
+  const merged = { ...DEFAULTS, ...config }
   const source = String(text ?? '').toLowerCase()
   const attachments = Number(config.attachments ?? 0)
-  const provider = merged.provider
-  const modelOf = (key) => merged.models[key] ?? merged.models.default
-  const pick = (target, rule) => ({ provider, model: modelOf(target), rule })
 
-  // 带图片/文件 → 视觉模型
-  if (attachments > 0) return pick('vision', 'attachment')
-  // 超长文本 → 长上下文模型
-  if (source.length > (merged.longTextChars ?? DEFAULTS.longTextChars)) return pick('longDoc', 'long-text')
+  const resolve = (target, rule) => {
+    const hit = resolvedMap[target] ?? resolvedMap.default
+    return hit ? { ...hit, rule } : null
+  }
+
+  if (attachments > 0) return resolve('vision', 'attachment')
+  if (source.length > (merged.longTextChars ?? DEFAULTS.longTextChars)) return resolve('longDoc', 'long-text')
 
   for (const rule of merged.rules ?? []) {
     const hit = (rule.match ?? []).some((keyword) => keyword && source.includes(String(keyword).toLowerCase()))
-    if (hit) return pick(rule.target ?? 'default', rule.id ?? 'matched')
+    if (hit) return resolve(rule.target ?? 'default', rule.id ?? 'matched')
   }
-  return pick('default', 'default')
+  return resolve('default', 'default')
 }
 
 export function apply(ctx, config = {}) {
-  const merged = { ...DEFAULTS, ...config, models: { ...DEFAULTS.models, ...(config.models ?? {}) } }
+  const merged = { ...DEFAULTS, ...config }
   if (!merged.enabled) return
 
   const logger = ctx.logger?.('dsh-model-router')
   const lastChoice = new Map()
   const degradedTurn = new Map()
-  let activeProvider = merged.provider
-  let detected = false
 
-  /** 配置的 provider 不在运行时注册表里时，找一个能提供同名模型的 provider。 */
-  async function resolveProvider() {
-    if (detected) return activeProvider
-    detected = true
-    if (!merged.autoDetectProvider) return activeProvider
-    const llm = ctx.get?.('llm')
-    if (!llm?.listProviders) return activeProvider
-    try {
+  // resolvedMap：显式 models 优先，否则等自动识别完成
+  let resolvedMap = {}
+  let discoveryPromise
+
+  function discover() {
+    if (discoveryPromise) return discoveryPromise
+    discoveryPromise = (async () => {
+      const llm = ctx.get?.('llm')
+      if (!llm?.listProviders) return
+      const catalog = []
       const providers = await llm.listProviders()
-      const ids = providers.map((p) => p.id ?? p.name).filter(Boolean)
-      if (ids.includes(activeProvider)) return activeProvider
-      // 逐个问：谁能提供 models.default
-      for (const id of ids) {
+      for (const provider of providers) {
+        const id = provider.id ?? provider.name
+        if (!id) continue
+        let models = []
         try {
-          const models = await llm.listModels(id)
-          if ((models ?? []).some((m) => m.id === merged.models.default)) {
-            logger?.warn?.(`provider ${activeProvider} 不存在，改用 ${id}`)
-            activeProvider = id
-            return id
-          }
+          models = await llm.listModels(id)
         } catch {}
+        for (const model of models ?? []) {
+          catalog.push({
+            provider: id,
+            id: model.id,
+            name: model.name ?? model.id,
+            modalities: model.inputModalities ?? [],
+          })
+        }
       }
-      logger?.warn?.(`没有找到能提供 ${merged.models.default} 的 provider，保持 ${activeProvider}`)
-    } catch (error) {
-      logger?.warn?.(`探测 provider 失败：${error?.message ?? error}`)
-    }
-    return activeProvider
+      const discovered = discoverModelMap(catalog)
+      resolvedMap = { ...discovered, ...(merged.models ?? {}) }
+      if (catalog.length) {
+        logger?.info?.(`已识别 ${catalog.length} 个模型：${Object.entries(resolvedMap)
+          .map(([key, value]) => `${key}=${value.model}`)
+          .join(', ')}`)
+      } else {
+        logger?.warn?.('运行时没有可读的模型目录，路由保持空闲')
+      }
+    })().catch((error) => logger?.warn?.(`识别模型失败：${error?.message ?? error}`))
+    return discoveryPromise
   }
+
+  // 启动即扫，通常在第一条消息到达前完成。
+  discover()
 
   ctx.on('agent/inbox/claimed', (payload) => {
     const turn = payload?.turn ?? 0
@@ -208,71 +279,81 @@ export function apply(ctx, config = {}) {
       payload?.agent?.session?.id ?? payload?.agent?.session?.header?.id ?? payload?.agent?.sessionId
     if (!sessionId) return
 
-    const { text, attachments } = textOf(payload?.message)
-    const choice = pickModel(text, { ...merged, attachments })
-
-    const snapshot = readSnapshot()
-    const stale = !snapshot || snapshot.ageMs > (merged.snapshotStaleMinutes ?? 60) * 60_000
-    if (stale) refreshSnapshotInBackground(logger)
-    const snap = snapshot?.data
-    const fiveHour = (snap?.planPeriods ?? []).find((p) => p.label === '5h')
-    const planOk = stale || !fiveHour ? true : fiveHour.percent < (merged.planCeilingPercent ?? 95)
-    const credits = snap?.workbuddyCredits
-    const creditsOk = typeof credits === 'number' ? credits >= (merged.workbuddyMinCredits ?? 50) : true
-    const canUseWorkbuddy = turn <= (merged.workbuddyMaxTurn ?? 5)
-
-    // 套餐额度不够：WorkBuddy → fallback → 不动
-    if (!planOk) {
-      if (canUseWorkbuddy && creditsOk) {
-        logger?.warn?.(`套餐 5h 已用 ${fiveHour?.percent ?? '?'}%，降级到 WorkBuddy`)
-        choice.provider = merged.workbuddyFallback.provider
-        choice.model = merged.workbuddyFallback.model
-        choice.rule = `${choice.rule}-plan-full→workbuddy`
-      } else if (merged.fallback?.provider) {
-        logger?.warn?.('套餐满、WorkBuddy 不可用，降级到兜底 provider')
-        choice.provider = merged.fallback.provider
-        choice.model = merged.fallback.model
-        choice.rule = `${choice.rule}-plan-full→fallback`
-      } else {
-        logger?.warn?.('所有额度都不可用，保持当前模型不动')
-        return
-      }
-    }
-
-    // WorkBuddy 目标：长会话绕开（hy3 上下文很小）
-    if (choice.provider === merged.workbuddyFallback.provider && !canUseWorkbuddy) {
-      choice.provider = activeProvider
-      choice.model = merged.models.default
-      choice.rule = `${choice.rule}-long-session→plan`
-    }
-
-    const key = `${choice.provider}/${choice.model}`
-    if (lastChoice.get(sessionId) === key) return
-    lastChoice.set(sessionId, key)
-    logger?.info?.(`选模型：session=${sessionId} turn=${turn} rule=${choice.rule} → ${key}`)
-
     Promise.resolve()
       .then(async () => {
-        const provider = await resolveProvider()
+        await discover()
+
+        const { text, attachments } = textOf(payload?.message)
+        const choice = pickModel(text, { ...merged, attachments }, resolvedMap)
+        if (!choice) return
+
+        // 显式 provider：不用自动识别的 provider 路径
+        if (merged.provider !== 'auto') choice.provider = merged.provider
+
+        const snapshot = readSnapshot()
+        const stale = !snapshot || snapshot.ageMs > (merged.snapshotStaleMinutes ?? 60) * 60_000
+        if (stale) refreshSnapshotInBackground(logger)
+        const snap = snapshot?.data
+        const fiveHour = (snap?.planPeriods ?? []).find((p) => p.label === '5h')
+        const planOk = stale || !fiveHour ? true : fiveHour.percent < (merged.planCeilingPercent ?? 95)
+        const credits = snap?.workbuddyCredits
+        const creditsOk = typeof credits === 'number' ? credits >= (merged.workbuddyMinCredits ?? 50) : true
+        const canUseWorkbuddy = turn <= (merged.workbuddyMaxTurn ?? 5)
+
+        // 额度不足：WorkBuddy → fallback → 不动
+        if (!planOk) {
+          if (merged.workbuddyFallback && canUseWorkbuddy && creditsOk) {
+            logger?.warn?.(`额度已用 ${fiveHour?.percent ?? '?'}%，降级到 WorkBuddy`)
+            choice.provider = merged.workbuddyFallback.provider
+            choice.model = merged.workbuddyFallback.model
+            choice.rule = `${choice.rule}-plan-full→workbuddy`
+          } else if (merged.fallback?.provider) {
+            logger?.warn?.('额度满、WorkBuddy 不可用，降级到兜底 provider')
+            choice.provider = merged.fallback.provider
+            choice.model = merged.fallback.model
+            choice.rule = `${choice.rule}-plan-full→fallback`
+          } else {
+            logger?.warn?.('所有额度都不可用，保持当前模型不动')
+            return
+          }
+        }
+
+        // WorkBuddy 目标：长会话绕开（小上下文模型会撑爆）
+        if (
+          merged.workbuddyFallback &&
+          choice.provider === merged.workbuddyFallback.provider &&
+          !canUseWorkbuddy
+        ) {
+          choice.provider = resolvedMap.default?.provider ?? choice.provider
+          choice.model = resolvedMap.default?.model ?? choice.model
+          choice.rule = `${choice.rule}-long-session`
+        }
+
+        const key = `${choice.provider}/${choice.model}`
+        if (lastChoice.get(sessionId) === key) return
+        lastChoice.set(sessionId, key)
+        logger?.info?.(`选模型：session=${sessionId} turn=${turn} rule=${choice.rule} → ${key}`)
+
         await ctx.sessionController.selectModel({
           sessionId,
-          provider: provider === merged.provider ? choice.provider : provider,
+          provider: choice.provider,
           model: choice.model,
         })
       })
       .catch((error) => logger?.warn?.(`选模型失败：${error?.message ?? error}`))
   })
 
-  // 套餐请求失败（订阅抖动 / 5xx）时切到 fallback 并重试同一轮，每会话每轮只兜底一次。
+  // 主 provider 请求失败（抖动 / 5xx）时切到 fallback 并重试同一轮，每会话每轮只兜底一次。
   ctx.on('agent/request-error', async (payload, next) => {
     try {
       if (!merged.fallbackOnError || !merged.fallback?.provider) return next()
-      if (payload?.provider !== merged.provider) return next()
       const sessionId = payload?.agent?.id
       const turn = payload?.turn ?? 0
       if (!sessionId || degradedTurn.get(sessionId) === turn) return next()
 
       const failure = payload?.failure ?? {}
+      const providerOk = merged.provider === 'auto' ? true : payload?.provider === merged.provider
+      if (!providerOk) return next()
       const pattern = new RegExp(merged.fallbackErrorPattern ?? DEFAULTS.fallbackErrorPattern, 'i')
       if (!pattern.test(`${failure.code ?? ''} ${failure.message ?? ''}`)) return next()
 
@@ -283,7 +364,7 @@ export function apply(ctx, config = {}) {
         model: merged.fallback.model,
       })
       logger?.warn?.(
-        `套餐请求失败（${failure.code ?? failure.status ?? '?'}），已切到 ${merged.fallback.provider}/${merged.fallback.model} 并重试`,
+        `请求失败（${failure.code ?? failure.status ?? '?'}），已切到 ${merged.fallback.provider}/${merged.fallback.model} 并重试`,
       )
       return { kind: 'retry' }
     } catch (error) {
