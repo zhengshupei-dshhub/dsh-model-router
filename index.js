@@ -53,7 +53,7 @@ const DEFAULTS = {
   default: { provider: 'ark-agent-plan', model: 'deepseek-v4-flash-260801' },
   // 套餐 5h 快满时，套餐模型 → 免费包等价物
   planToPack: {
-    'kimi-k3-260701': 'kimi-k3-1-pro-261024',
+    'kimi-k3-260701': 'doubao-seed-2-1-pro-260915',
     'deepseek-v4-flash-260801': 'deepseek-v4-flash-ga-260731',
     'glm-5-3-260801': 'glm-5-2-260617',
     'glm-5-3-flash-260901': 'glm-5-3-flash-260828',
