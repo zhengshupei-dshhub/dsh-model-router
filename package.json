@@ -1,9 +1,9 @@
 {
   "name": "@local/dsh-model-router",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "private": true,
   "type": "module",
-  "description": "开局选模型：新会话第一条消息按任务类型自动切换到合适的模型（白名单内）",
+  "description": "开局选模型：按任务关键词自动切换最合适的模型，provider 与模型映射均可配置",
   "exports": {
     ".": "./index.js",
     "./locale/*.json": "./locale/*.json",

@@ -1,15 +1,13 @@
 /**
- * 开局选模型：按用户消息的关键词，把当前会话切到套餐里最合适的模型。
+ * 开局选模型：按用户消息的关键词，把当前会话切到最合适的模型。
  *
- * 2026-11-05 重写：Agent Plan 改用官方 `arkcli helper` 接入，
- * provider 变成 `arkcli-agent-plan`，模型是公开短名（doubao-seed-2.1-pro 等），
- * 不再是之前手配的版本号 id。
+ * 通用性设计（2026-11-05 v2.2.0）：
+ * - provider / 模型名全部来自配置，默认值是我们这套 Agent Plan（arkcli-agent-plan）；
+ * - 别人用 Coding Plan、OpenAI、Anthropic 或自建端点，只改 config 里的 provider 和 models；
+ * - 配置里没写、但运行时注册了别的 provider 时，会自动找一个能提供同名模型的 provider；
+ * - 多出来的两档降级（WorkBuddy / DeepSeek 账号）也可以关掉，只留套餐。
  *
- * 设计取舍：
- * - 纯关键词匹配，不发额外的分类请求（零成本、零延迟）；
- * - 每轮都判断（perTurn），但目标没变就不写；
- * - 套餐 5 小时额度接近上限时，按 WorkBuddy → DeepSeek 账号 → 不动 降级；
- * - 任何一步失败都只写日志，不影响正常对话。
+ * 匹配逻辑：纯关键词，不发额外请求，零成本、零延迟。
  */
 
 import { spawn } from 'node:child_process'
@@ -46,86 +44,84 @@ function refreshSnapshotInBackground(logger) {
   }
 }
 
-const PROVIDER = 'arkcli-agent-plan'
-
 export const DEFAULTS = {
   enabled: true,
+  // 主 provider：换套餐就改这里（Coding Plan 一般是 arkcli-coding-plan）
+  provider: 'arkcli-agent-plan',
+  // provider 不匹配时，是否自动找一个能提供同名模型的 provider
+  autoDetectProvider: true,
   // 每轮用户消息都重新判断（目标没变不写）
   perTurn: true,
+  // 超过这么多字符的输入直接上「长文本」模型
+  longTextChars: 20000,
   // 套餐 5 小时窗口用到这个百分比就算「不可用」，开始降级
   planCeilingPercent: 95,
-  // 降级第二档：WorkBuddy（积分制），hy3 上下文小，只在前几轮用
+  // 包/套餐快照超过这么多分钟没更新就视为「未知」，按可用处理（宁可 429 也不误扣费）
+  snapshotStaleMinutes: 60,
+  // 失败兜底：套餐请求报错时切到 fallback 并重试同一轮
+  fallbackOnError: true,
+  fallbackErrorPattern: 'InvalidSubscription|InternalServiceError|5\\d\\d|429|ServiceUnavailable',
+  // 兜底目标（按需改；不想要按量计费就把 fallback 设为 null）
+  fallback: { provider: 'deepseek-account', model: 'deepseek-flash' },
+  // 额度不足时的降级链：workbuddy（积分）→ fallback（上面那个）
   workbuddyFallback: { provider: 'workbuddy', model: 'hy3' },
   workbuddyMaxTurn: 5,
   workbuddyMinCredits: 50,
-  // 降级第三档：按 token 计费的 DeepSeek 账号
-  deepseekFallback: { provider: 'deepseek-account', model: 'deepseek-flash' },
-  // 套餐请求失败（订阅抖动 / 5xx）时，自动切到 DeepSeek 账号并重试同一轮
-  fallbackOnError: true,
-  // 命中这些错误才兜底（套餐端点抖动为主）
-  fallbackErrorPattern: 'InvalidSubscription|InternalServiceError|5\\d\\d|429|ServiceUnavailable',
-  // 快照超过这么多分钟没更新就视为「未知」：宁可走套餐（最多 429），也不倒向按量计费
-  snapshotStaleMinutes: 60,
-  // 超过这个字符数直接上 1M 上下文的模型
-  longTextChars: 20000,
-  default: { provider: PROVIDER, model: 'doubao-seed-2.1-pro' },
-  vision: { provider: PROVIDER, model: 'kimi-k3.1-pro' },
+
+  // ── 模型映射：别人换 provider 时主要改这里 ──
+  models: {
+    default: 'doubao-seed-2.1-pro',
+    reasoning: 'deepseek-v4-pro',
+    code: 'kimi-k3.1-pro',
+    codeSmall: 'deepseek-v4.1-flash',
+    review: 'kimi-k3.1-pro',
+    longDoc: 'kimi-k3.1-pro',
+    vision: 'kimi-k3.1-pro',
+    writing: 'glm-5.3',
+    light: 'deepseek-v4.1-flash-economy',
+  },
+
+  // 关键词规则：target 指向上面 models 里的键
   rules: [
-    // 1) 硬推理：数学 / 算法 / 证明
     {
       id: 'reasoning',
+      target: 'reasoning',
       match: ['数学', '算法', '证明', '证一下', '推导', '不等式', '逻辑证明', '复杂度', '最优解', '递推', '方程', '归纳法'],
-      provider: PROVIDER,
-      model: 'deepseek-v4-pro',
     },
-    // 2) 单文件小改 / 补测试 / 样板代码
     {
       id: 'code-small',
+      target: 'codeSmall',
       match: ['单文件', '小改', '补测试', '改个 bug', '修一个小 bug', '补个函数', '写个脚本', '样板', '改一下'],
-      provider: PROVIDER,
-      model: 'deepseek-v4.1-flash',
     },
-    // 3) 跨文件重构 / 架构 / 疑难 bug
     {
       id: 'code',
+      target: 'code',
       match: ['重构', '架构', '疑难', '调试', '报错', '多文件', '跨文件', '整个项目', '依赖冲突', '设计模式'],
-      provider: PROVIDER,
-      model: 'kimi-k3.1-pro',
     },
-    // 4) 代码审查 / 独立调查
     {
       id: 'review',
+      target: 'review',
       match: ['审查', 'review', '排查', '调查', '审计', '评审', '检查一下'],
-      provider: PROVIDER,
-      model: 'kimi-k3.1-pro',
     },
-    // 5) 长文档 / 论文 / 大代码库通读
     {
       id: 'long-doc',
+      target: 'longDoc',
       match: ['长文档', '通读', '整篇', '论文', 'pdf', '翻译整篇', '代码库', '大文件', '整本书', '全文'],
-      provider: PROVIDER,
-      model: 'kimi-k3.1-pro',
     },
-    // 6) 看图 / 截图 / 视频理解
     {
       id: 'vision',
+      target: 'vision',
       match: ['截图', '看图', '图片', '照片', '这张图', '视频里', '识别一下', 'ocr', '这张'],
-      provider: PROVIDER,
-      model: 'kimi-k3.1-pro',
     },
-    // 7) 中文文案 / 剧本 / 创意写作
     {
       id: 'writing',
+      target: 'writing',
       match: ['文案', '剧本', '故事', '润色', '写一篇', '创作', '标题党', '小红书', '公众号', '口播'],
-      provider: PROVIDER,
-      model: 'glm-5.3',
     },
-    // 8) 格式转换 / 抽取 / 分类 / 批量改写
     {
       id: 'light',
+      target: 'light',
       match: ['格式转换', '提取', '分类', '重命名', '列一下', '改写标题', '批量', '转成', 'json', 'csv', '表格'],
-      provider: PROVIDER,
-      model: 'deepseek-v4.1-flash-economy',
     },
   ],
 }
@@ -142,44 +138,74 @@ export function textOf(message) {
   return { text, attachments }
 }
 
-/** 按顺序匹配规则，返回第一条命中的取舍；都没命中就返回默认。纯函数，便于测。 */
+/**
+ * 选出目标模型。纯函数，便于测试。
+ * 返回 { provider, model, rule }；provider 取配置值。
+ */
 export function pickModel(text, config = {}) {
-  const merged = { ...DEFAULTS, ...config }
+  const merged = { ...DEFAULTS, ...config, models: { ...DEFAULTS.models, ...(config.models ?? {}) } }
   const source = String(text ?? '').toLowerCase()
   const attachments = Number(config.attachments ?? 0)
-  const longTextChars = Number(merged.longTextChars ?? DEFAULTS.longTextChars)
+  const provider = merged.provider
+  const modelOf = (key) => merged.models[key] ?? merged.models.default
+  const pick = (target, rule) => ({ provider, model: modelOf(target), rule })
 
-  // 带图片/文件：用支持视觉的模型
-  if (attachments > 0) {
-    return { ...merged.vision, rule: 'attachment' }
-  }
-  // 超长文本：用 1M 上下文的模型
-  if (source.length > longTextChars) {
-    return { ...merged.vision, rule: 'long-text' }
-  }
+  // 带图片/文件 → 视觉模型
+  if (attachments > 0) return pick('vision', 'attachment')
+  // 超长文本 → 长上下文模型
+  if (source.length > (merged.longTextChars ?? DEFAULTS.longTextChars)) return pick('longDoc', 'long-text')
+
   for (const rule of merged.rules ?? []) {
     const hit = (rule.match ?? []).some((keyword) => keyword && source.includes(String(keyword).toLowerCase()))
-    if (hit && rule.provider && rule.model) {
-      return { provider: rule.provider, model: rule.model, rule: rule.id ?? 'matched' }
-    }
+    if (hit) return pick(rule.target ?? 'default', rule.id ?? 'matched')
   }
-  return { ...merged.default, rule: 'default' }
+  return pick('default', 'default')
 }
 
 export function apply(ctx, config = {}) {
-  const merged = { ...DEFAULTS, ...config }
+  const merged = { ...DEFAULTS, ...config, models: { ...DEFAULTS.models, ...(config.models ?? {}) } }
   if (!merged.enabled) return
 
   const logger = ctx.logger?.('dsh-model-router')
   const lastChoice = new Map()
+  const degradedTurn = new Map()
+  let activeProvider = merged.provider
+  let detected = false
+
+  /** 配置的 provider 不在运行时注册表里时，找一个能提供同名模型的 provider。 */
+  async function resolveProvider() {
+    if (detected) return activeProvider
+    detected = true
+    if (!merged.autoDetectProvider) return activeProvider
+    const llm = ctx.get?.('llm')
+    if (!llm?.listProviders) return activeProvider
+    try {
+      const providers = await llm.listProviders()
+      const ids = providers.map((p) => p.id ?? p.name).filter(Boolean)
+      if (ids.includes(activeProvider)) return activeProvider
+      // 逐个问：谁能提供 models.default
+      for (const id of ids) {
+        try {
+          const models = await llm.listModels(id)
+          if ((models ?? []).some((m) => m.id === merged.models.default)) {
+            logger?.warn?.(`provider ${activeProvider} 不存在，改用 ${id}`)
+            activeProvider = id
+            return id
+          }
+        } catch {}
+      }
+      logger?.warn?.(`没有找到能提供 ${merged.models.default} 的 provider，保持 ${activeProvider}`)
+    } catch (error) {
+      logger?.warn?.(`探测 provider 失败：${error?.message ?? error}`)
+    }
+    return activeProvider
+  }
 
   ctx.on('agent/inbox/claimed', (payload) => {
     const turn = payload?.turn ?? 0
     if (turn !== 1 && !merged.perTurn) return
     const sessionId =
-      payload?.agent?.session?.id ??
-      payload?.agent?.session?.header?.id ??
-      payload?.agent?.sessionId
+      payload?.agent?.session?.id ?? payload?.agent?.session?.header?.id ?? payload?.agent?.sessionId
     if (!sessionId) return
 
     const { text, attachments } = textOf(payload?.message)
@@ -190,71 +216,75 @@ export function apply(ctx, config = {}) {
     if (stale) refreshSnapshotInBackground(logger)
     const snap = snapshot?.data
     const fiveHour = (snap?.planPeriods ?? []).find((p) => p.label === '5h')
-    // 快照过期时按「套餐可用」处理：误判的代价是 429（免费），
-    // 反过来误判会直接切到按量计费的 DeepSeek 账号。
     const planOk = stale || !fiveHour ? true : fiveHour.percent < (merged.planCeilingPercent ?? 95)
     const credits = snap?.workbuddyCredits
     const creditsOk = typeof credits === 'number' ? credits >= (merged.workbuddyMinCredits ?? 50) : true
     const canUseWorkbuddy = turn <= (merged.workbuddyMaxTurn ?? 5)
 
-    // 套餐额度不够：WorkBuddy → DeepSeek 账号 → 不动
-    if (choice.provider === PROVIDER && !planOk) {
+    // 套餐额度不够：WorkBuddy → fallback → 不动
+    if (!planOk) {
       if (canUseWorkbuddy && creditsOk) {
         logger?.warn?.(`套餐 5h 已用 ${fiveHour?.percent ?? '?'}%，降级到 WorkBuddy`)
         choice.provider = merged.workbuddyFallback.provider
         choice.model = merged.workbuddyFallback.model
         choice.rule = `${choice.rule}-plan-full→workbuddy`
-      } else if (merged.deepseekFallback?.provider) {
-        logger?.warn?.('套餐满、WorkBuddy 不可用，最后走 DeepSeek 账号（按 token 计费）')
-        choice.provider = merged.deepseekFallback.provider
-        choice.model = merged.deepseekFallback.model
-        choice.rule = `${choice.rule}-plan-full→deepseek`
+      } else if (merged.fallback?.provider) {
+        logger?.warn?.('套餐满、WorkBuddy 不可用，降级到兜底 provider')
+        choice.provider = merged.fallback.provider
+        choice.model = merged.fallback.model
+        choice.rule = `${choice.rule}-plan-full→fallback`
       } else {
         logger?.warn?.('所有额度都不可用，保持当前模型不动')
         return
       }
     }
 
-    // WorkBuddy 目标：长会话一律绕开（hy3 上下文很小，会把长会话撑爆）
-    if (choice.provider === 'workbuddy' && !canUseWorkbuddy) {
-      choice.provider = PROVIDER
-      choice.model = merged.default.model
+    // WorkBuddy 目标：长会话绕开（hy3 上下文很小）
+    if (choice.provider === merged.workbuddyFallback.provider && !canUseWorkbuddy) {
+      choice.provider = activeProvider
+      choice.model = merged.models.default
       choice.rule = `${choice.rule}-long-session→plan`
     }
 
-    logger?.info?.(`选模型：session=${sessionId} turn=${turn} rule=${choice.rule} → ${choice.provider}/${choice.model}`)
-
-    // 目标模型没变就不写
-    if (lastChoice.get(sessionId) === `${choice.provider}/${choice.model}`) return
-    lastChoice.set(sessionId, `${choice.provider}/${choice.model}`)
+    const key = `${choice.provider}/${choice.model}`
+    if (lastChoice.get(sessionId) === key) return
+    lastChoice.set(sessionId, key)
+    logger?.info?.(`选模型：session=${sessionId} turn=${turn} rule=${choice.rule} → ${key}`)
 
     Promise.resolve()
-      .then(() => ctx.sessionController.selectModel({ sessionId, provider: choice.provider, model: choice.model }))
+      .then(async () => {
+        const provider = await resolveProvider()
+        await ctx.sessionController.selectModel({
+          sessionId,
+          provider: provider === merged.provider ? choice.provider : provider,
+          model: choice.model,
+        })
+      })
       .catch((error) => logger?.warn?.(`选模型失败：${error?.message ?? error}`))
   })
 
-  // 套餐端点抖动（InvalidSubscription / 5xx）时：切到 DeepSeek 账号并重试同一轮。
-  // 每个会话每轮只兜底一次，避免死循环把重试次数烧光。
-  const degradedTurn = new Map()
-
+  // 套餐请求失败（订阅抖动 / 5xx）时切到 fallback 并重试同一轮，每会话每轮只兜底一次。
   ctx.on('agent/request-error', async (payload, next) => {
     try {
-      if (!merged.fallbackOnError) return next()
-      const provider = payload?.provider
-      if (provider !== PROVIDER) return next()
+      if (!merged.fallbackOnError || !merged.fallback?.provider) return next()
+      if (payload?.provider !== merged.provider) return next()
       const sessionId = payload?.agent?.id
       const turn = payload?.turn ?? 0
       if (!sessionId || degradedTurn.get(sessionId) === turn) return next()
 
       const failure = payload?.failure ?? {}
-      const text = `${failure.code ?? ''} ${failure.message ?? ''}`
       const pattern = new RegExp(merged.fallbackErrorPattern ?? DEFAULTS.fallbackErrorPattern, 'i')
-      if (!pattern.test(text)) return next()
+      if (!pattern.test(`${failure.code ?? ''} ${failure.message ?? ''}`)) return next()
 
       degradedTurn.set(sessionId, turn)
-      const target = merged.deepseekFallback
-      await ctx.sessionController.selectModel({ sessionId, provider: target.provider, model: target.model })
-      logger?.warn?.(`套餐请求失败（${failure.code ?? failure.status ?? '?'}），已切到 ${target.provider}/${target.model} 并重试`)
+      await ctx.sessionController.selectModel({
+        sessionId,
+        provider: merged.fallback.provider,
+        model: merged.fallback.model,
+      })
+      logger?.warn?.(
+        `套餐请求失败（${failure.code ?? failure.status ?? '?'}），已切到 ${merged.fallback.provider}/${merged.fallback.model} 并重试`,
+      )
       return { kind: 'retry' }
     } catch (error) {
       logger?.warn?.(`兜底切换失败：${error?.message ?? error}`)

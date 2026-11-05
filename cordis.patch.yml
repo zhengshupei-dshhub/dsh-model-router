@@ -3,5 +3,14 @@
       name: '@local/dsh-model-router'
       config:
         enabled: true
+        # 换套餐改这里：Coding Plan 一般是 arkcli-coding-plan
+        provider: arkcli-agent-plan
+        autoDetectProvider: true
         perTurn: true
         planCeilingPercent: 95
+        snapshotStaleMinutes: 60
+        fallbackOnError: true
+        # 不需要按量计费兜底就把 fallback 设为 null
+        fallback:
+          provider: deepseek-account
+          model: deepseek-flash
