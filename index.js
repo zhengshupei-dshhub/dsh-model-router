@@ -18,26 +18,54 @@ const DEFAULTS = {
   default: { provider: 'ark-agent-plan', model: 'deepseek-v4-flash-260801' },
   longTextChars: 20000,
   rules: [
-    // 1) 硬推理：数学 / 算法 / 证明 / 复杂逻辑 —— 用深思考
+    // 1) 硬推理：数学 / 算法 / 证明 / 复杂逻辑
     {
       id: 'reasoning',
       match: ['数学', '算法', '证明', '证一下', '推导', '不等式', '逻辑证明', '复杂度', '最优解', '递推', '方程', '归纳法'],
       provider: 'ark-agent-plan',
       model: 'deepseek-v4-pro-ga-260801',
     },
-    // 7) 单文件小改 / 补测试 / 样板代码 —— 不必上贵模型
+    // 2) 单文件小改 / 补测试 / 样板代码
     {
       id: 'code-small',
       match: ['单文件', '小改', '补测试', '改个 bug', '修一个小 bug', '补个函数', '写个脚本', '样板', '改一下'],
       provider: 'ark-agent-plan',
       model: 'deepseek-v4-flash-260801',
     },
-    // 2) 跨文件重构、架构设计、疑难 bug —— 上 1M 且代码强的模型
+    // 3) 跨文件重构、架构设计、疑难 bug
     {
       id: 'code',
       match: ['重构', '架构', '疑难', '调试', '报错', '多文件', '跨文件', '整个项目', '依赖冲突', '设计模式'],
       provider: 'ark-agent-plan',
       model: 'kimi-k3-1-pro-261001',
+    },
+    // 4) 代码审查 / 独立调查
+    {
+      id: 'review',
+      match: ['审查', 'review', '排查', '调查', '审计', '评审', '检查一下'],
+      provider: 'ark-agent-plan',
+      model: 'kimi-k3-1-pro-261001',
+    },
+    // 5) 长文档 / 论文 / 大代码库通读
+    {
+      id: 'long-doc',
+      match: ['长文档', '通读', '整篇', '论文', 'pdf', '翻译整篇', '代码库', '大文件', '整本书', '全文'],
+      provider: 'ark-agent-plan',
+      model: 'kimi-k3-1-pro-261001',
+    },
+    // 6) 看图 / 截图 / 视频理解
+    {
+      id: 'vision',
+      match: ['截图', '看图', '图片', '照片', '这张图', '视频里', '识别一下', 'ocr', '这张'],
+      provider: 'ark-agent-plan',
+      model: 'kimi-k3-1-pro-261001',
+    },
+    // 7) 中文文案 / 剧本 / 创意写作 —— GLM（订阅制，不另计费）
+    {
+      id: 'writing',
+      match: ['文案', '剧本', '故事', '润色', '写一篇', '创作', '标题党', '小红书', '公众号', '口播'],
+      provider: 'ark-agent-plan',
+      model: 'glm-5-3-260801',
     },
     // 8) 格式转换 / 抽取 / 分类 / 批量改写
     {
