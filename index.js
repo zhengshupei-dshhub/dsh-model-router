@@ -1,0 +1,129 @@
+/**
+ * 开局选模型：新会话的第一条用户消息里判断任务类型，
+ * 然后用 sessionController.selectModel 把这个会话的模型切到白名单里最合适的一个。
+ *
+ * 设计取舍：
+ * - 只在「每个会话的第一条消息」做一次，之后不干预（避免打断用户手动选择）；
+ * - 纯关键词匹配，不发额外的分类请求（零成本、零延迟）；
+ * - 任何一步失败都只写日志，不影响正常对话。
+ */
+
+export const inject = ['sessionController']
+
+const DEFAULTS = {
+  enabled: true,
+  default: { provider: 'ark-agent-plan', model: 'doubao-seed-2-0-pro-260215' },
+  // 长文本阈值：超过这个字符数优先上 1M 上下文的模型
+  longTextChars: 20000,
+  rules: [
+    {
+      id: 'light',
+      match: ['格式转换', '提取', '分类', '重命名', '列一下', '改写标题', '简单问题'],
+      provider: 'ark-agent-plan',
+      model: 'doubao-seed-2-0-mini-260428',
+    },
+    {
+      id: 'long-doc',
+      match: ['长文档', '通读', '整篇', '论文', 'pdf', '翻译整篇', '代码库', '大文件'],
+      provider: 'ark-agent-plan',
+      model: 'kimi-k3-1-pro-261001',
+    },
+    {
+      id: 'writing',
+      match: ['文案', '剧本', '故事', '润色', '写一篇', '创作', '标题党'],
+      provider: 'ark-agent-plan',
+      model: 'doubao-seed-2-1-pro-260915',
+    },
+    {
+      id: 'code',
+      match: ['重构', '调试', '报错', 'bug', '函数', '接口', '测试', '部署', '脚本', '代码'],
+      provider: 'ark-agent-plan',
+      model: 'doubao-seed-2-1-pro-260915',
+    },
+  ],
+}
+
+/** 从 UserMessage 的 content 里拼出纯文本，并报告是否带了图片/文件附件。 */
+export function textOf(message) {
+  const blocks = Array.isArray(message?.content) ? message.content : []
+  const text = blocks
+    .filter((block) => block?.type === 'text' && typeof block.text === 'string')
+    .map((block) => block.text)
+    .join('\n')
+    .trim()
+  const attachments = blocks.filter((block) => block?.type === 'image' || block?.type === 'file').length
+  return { text, attachments }
+}
+
+/** 按顺序匹配规则，返回第一条命中的取舍；都没命中就返回默认。纯函数，便于测。 */
+export function pickModel(text, config = {}) {
+  const merged = { ...DEFAULTS, ...config }
+  const source = String(text ?? '').toLowerCase()
+  const attachments = Number(config.attachments ?? 0)
+  const longTextChars = Number(merged.longTextChars ?? DEFAULTS.longTextChars)
+
+  // 前置判断一：超长文本优先 1M 上下文的模型，避免中途被截断。
+  if (source.length > longTextChars) {
+    return {
+      provider: merged.longDoc?.provider ?? 'ark-agent-plan',
+      model: merged.longDoc?.model ?? 'kimi-k3-1-pro-261001',
+      rule: 'long-text',
+    }
+  }
+  // 前置判断二：带图片/文件时用视觉模型（默认模型本身支持图，这里显式点出来）。
+  if (attachments > 0) {
+    return {
+      provider: merged.vision?.provider ?? 'ark-agent-plan',
+      model: merged.vision?.model ?? 'doubao-seed-2-1-pro-260915',
+      rule: 'attachment',
+    }
+  }
+  for (const rule of merged.rules ?? []) {
+    const hit = (rule.match ?? []).some((keyword) => keyword && source.includes(String(keyword).toLowerCase()))
+    if (hit && rule.provider && rule.model) {
+      return { provider: rule.provider, model: rule.model, rule: rule.id ?? 'matched' }
+    }
+  }
+  return { ...merged.default, rule: 'default' }
+}
+
+export function apply(ctx, config = {}) {
+  const merged = { ...DEFAULTS, ...config }
+  if (!merged.enabled) return
+
+  // 每个会话只路由一次；进程重启后重新计。
+  const routed = new Set()
+  const logger = ctx.logger?.('dsh-model-router')
+
+  // 2026-11-05 修正：原来监听 session/event，把「插件加载后的第一条消息」当成
+  // 「新会话的第一条消息」，结果把一条几十万 token 的老会话切到了 256k 上下文
+  // 的模型上，直接 400（image+text exceed max message tokens）。
+  // 现在只认 agent/inbox/claimed 且 turn === 1 —— 真正的会话第一轮。
+  ctx.on('agent/inbox/claimed', (payload) => {
+    if ((payload?.turn ?? 0) !== 1) return
+    const sessionId =
+      payload?.agent?.session?.id ??
+      payload?.agent?.session?.header?.id ??
+      payload?.agent?.sessionId
+    if (!sessionId || routed.has(sessionId)) return
+    routed.add(sessionId)
+    const event = { data: payload?.message }
+
+    const { text, attachments } = textOf(event.data ?? payload?.message)
+    const choice = pickModel(text, { ...merged, attachments })
+    logger?.info?.(`开局选模型：session=${sessionId} rule=${choice.rule} → ${choice.provider}/${choice.model}`)
+
+    Promise.resolve()
+      .then(() =>
+        ctx.sessionController.selectModel({
+          sessionId,
+          provider: choice.provider,
+          model: choice.model,
+        }),
+      )
+      .catch((error) => {
+        // 选模型失败不影响对话本身。
+        logger?.warn?.(`开局选模型失败：${error?.message ?? error}`)
+      })
+  })
+}

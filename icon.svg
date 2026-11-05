@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Model Router">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8fd3ff"/><stop offset="1" stop-color="#4f7cff"/>
+    </linearGradient>
+  </defs>
+  <circle cx="32" cy="32" r="26" fill="url(#g)" opacity="0.92"/>
+  <g stroke="#fff" stroke-width="3" stroke-linecap="round" fill="none">
+    <path d="M20 32h10M34 32h10"/>
+    <path d="M32 22v-4M32 46v-4"/>
+  </g>
+  <circle cx="32" cy="32" r="5" fill="#fff"/>
+</svg>

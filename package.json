@@ -1,0 +1,23 @@
+{
+  "name": "@local/dsh-model-router",
+  "version": "1.0.2",
+  "private": true,
+  "type": "module",
+  "description": "开局选模型：新会话第一条消息按任务类型自动切换到合适的模型（白名单内）",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

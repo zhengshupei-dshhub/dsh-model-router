@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Auto Model Router",
+    "description": "Picks a suitable whitelisted model from the first message of each new session (keyword matching, no extra requests)."
+  }
+}
