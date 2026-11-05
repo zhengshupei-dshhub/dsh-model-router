@@ -37,28 +37,10 @@ const DEFAULTS = {
   workbuddyMinCredits: 50,
   // 最后一档：按 token 计费的 DeepSeek 账号
   deepseekFallback: { provider: 'deepseek-account', model: 'deepseek-flash' },
-  // 平台端点被拦（欠费/未开通）时，免费包模型对应的套餐替代
-  packToPlan: {
-    'kimi-k3-1-pro-261024': 'kimi-k3-260701',
-    'deepseek-v4-pro-ga-260813': 'deepseek-v4-flash-260801',
-    'deepseek-v4-flash-ga-260731': 'deepseek-v4-flash-260801',
-    'deepseek-v4-1-flash-261017': 'deepseek-v4-flash-260801',
-    'deepseek-v4-1-flash-economy-261017': 'deepseek-v4-flash-260801',
-    'glm-5-2-260617': 'glm-5-3-260801',
-    'glm-5-3-flash-260828': 'glm-5-3-flash-260901',
-    'doubao-seed-2-1-pro-260915': 'doubao-seed-evolving-latest-version',
-    'doubao-seed-2-1-lite-260915': 'doubao-seed-evolving-latest-version',
-  },
-  // 兜底：1M 上下文里最便宜的 deepseek-v4-flash（系数 0.5）
+  // 免费包端点因平台密钥失效停用（2026-11-05），套餐满时直接降到 WorkBuddy
+  packToPlan: {},
+  planToPack: {},
   default: { provider: 'ark-agent-plan', model: 'deepseek-v4-flash-260801' },
-  // 套餐 5h 快满时，套餐模型 → 免费包等价物
-  planToPack: {
-    'kimi-k3-260701': 'doubao-seed-2-1-pro-260915',
-    'deepseek-v4-flash-260801': 'deepseek-v4-flash-ga-260731',
-    'glm-5-3-260801': 'glm-5-2-260617',
-    'glm-5-3-flash-260901': 'glm-5-3-flash-260828',
-    'doubao-seed-evolving-latest-version': 'doubao-seed-2-1-pro-260915',
-  },
   longTextChars: 20000,
   rules: [
     // 1) 硬推理：数学 / 算法 / 证明 / 复杂逻辑
