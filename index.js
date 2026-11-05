@@ -12,33 +12,37 @@ export const inject = ['sessionController']
 
 const DEFAULTS = {
   enabled: true,
-  default: { provider: 'ark-agent-plan', model: 'deepseek-v4-flash-260801' },   // 1M 上下文，系数 0.5
-  // 长文本阈值：超过这个字符数优先上 1M 上下文的模型
+  // 兜底：1M 上下文里最便宜的 deepseek-v4-flash（系数 0.5）
+  default: { provider: 'ark-agent-plan', model: 'deepseek-v4-flash-260801' },
   longTextChars: 20000,
   rules: [
+    // 1) 硬推理：数学 / 算法 / 证明 / 复杂逻辑 —— 用深思考
     {
-      id: 'light',
-      match: ['格式转换', '提取', '分类', '重命名', '列一下', '改写标题', '简单问题'],
+      id: 'reasoning',
+      match: ['数学', '算法', '证明', '证一下', '推导', '不等式', '逻辑证明', '复杂度', '最优解', '递推', '方程', '归纳法'],
+      provider: 'ark-agent-plan',
+      model: 'deepseek-v4-pro-ga-260801',
+    },
+    // 7) 单文件小改 / 补测试 / 样板代码 —— 不必上贵模型
+    {
+      id: 'code-small',
+      match: ['单文件', '小改', '补测试', '改个 bug', '修一个小 bug', '补个函数', '写个脚本', '样板', '改一下'],
       provider: 'ark-agent-plan',
       model: 'deepseek-v4-flash-260801',
     },
+    // 2) 跨文件重构、架构设计、疑难 bug —— 上 1M 且代码强的模型
     {
-      id: 'long-doc',
-      match: ['长文档', '通读', '整篇', '论文', 'pdf', '翻译整篇', '代码库', '大文件'],
+      id: 'code',
+      match: ['重构', '架构', '疑难', '调试', '报错', '多文件', '跨文件', '整个项目', '依赖冲突', '设计模式'],
       provider: 'ark-agent-plan',
       model: 'kimi-k3-1-pro-261001',
     },
+    // 8) 格式转换 / 抽取 / 分类 / 批量改写
     {
-      id: 'writing',
-      match: ['文案', '剧本', '故事', '润色', '写一篇', '创作', '标题党'],
+      id: 'light',
+      match: ['格式转换', '提取', '分类', '重命名', '列一下', '改写标题', '批量', '转成', 'json', 'csv', '表格'],
       provider: 'ark-agent-plan',
-      model: 'deepseek-v4-1-flash-261017',
-    },
-    {
-      id: 'code',
-      match: ['重构', '调试', '报错', 'bug', '函数', '接口', '测试', '部署', '脚本', '代码'],
-      provider: 'ark-agent-plan',
-      model: 'deepseek-v4-1-flash-261017',
+      model: 'deepseek-v4-flash-260801',
     },
   ],
 }
