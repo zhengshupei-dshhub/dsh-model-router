@@ -12,6 +12,8 @@ export const inject = ['sessionController']
 
 const DEFAULTS = {
   enabled: true,
+  // 是否每一轮用户消息都重新选模型（默认只在会话第一轮选一次）
+  perTurn: false,
   // 兜底：1M 上下文里最便宜的 deepseek-v4-flash（系数 0.5）
   default: { provider: 'ark-agent-plan', model: 'deepseek-v4-flash-260801' },
   longTextChars: 20000,
@@ -103,19 +105,30 @@ export function apply(ctx, config = {}) {
   // 「新会话的第一条消息」，结果把一条几十万 token 的老会话切到了 256k 上下文
   // 的模型上，直接 400（image+text exceed max message tokens）。
   // 现在只认 agent/inbox/claimed 且 turn === 1 —— 真正的会话第一轮。
+  // 每个会话上一次选中的模型，用于「目标没变就不写」的节流。
+  const lastChoice = new Map()
+
   ctx.on('agent/inbox/claimed', (payload) => {
-    if ((payload?.turn ?? 0) !== 1) return
+    const turn = payload?.turn ?? 0
+    // 默认只认第一轮；打开 perTurn 后每一轮都判断。
+    if (turn !== 1 && !merged.perTurn) return
     const sessionId =
       payload?.agent?.session?.id ??
       payload?.agent?.session?.header?.id ??
       payload?.agent?.sessionId
-    if (!sessionId || routed.has(sessionId)) return
+    if (!sessionId) return
+    // 首轮模式：每个会话只路由一次；perTurn 模式：只要目标模型没变就不重复写。
+    if (!merged.perTurn && routed.has(sessionId)) return
     routed.add(sessionId)
     const event = { data: payload?.message }
 
     const { text, attachments } = textOf(event.data ?? payload?.message)
     const choice = pickModel(text, { ...merged, attachments })
     logger?.info?.(`开局选模型：session=${sessionId} rule=${choice.rule} → ${choice.provider}/${choice.model}`)
+
+    // 目标模型没变就不打扰（尤其 perTurn 模式下，省掉重复写入）。
+    if (lastChoice.get(sessionId) === choice.model) return
+    lastChoice.set(sessionId, choice.model)
 
     Promise.resolve()
       .then(() =>

@@ -3,5 +3,7 @@
       name: '@local/dsh-model-router'
       config:
         enabled: true
+        # 打开后每一轮用户消息都会重新判断并切模型（默认只在会话第一轮切一次）
+        perTurn: false
         # 全部走 1M 上下文模型，避免会话变长后再次 400。
         # 具体规则在 index.js 的 DEFAULTS 里；要临时改模型就直接改那份表。
