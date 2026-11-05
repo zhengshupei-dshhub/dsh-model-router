@@ -29,10 +29,14 @@ const DEFAULTS = {
   // 免费包用尽后的降级顺序：先用套餐（订阅额度），再退 WorkBuddy（积分），都没有就不切
   planFallback: { provider: 'ark-agent-plan', model: 'deepseek-v4-flash-260801' },
   workbuddyFallback: { provider: 'workbuddy', model: 'hy3' },
+  // 小上下文模型（WorkBuddy hy3）只允许在前几轮用；长会话一律绕开
+  workbuddyMaxTurn: 5,
   // 套餐 5 小时窗口用到这个百分比就算「不可用」
   planCeilingPercent: 95,
   // WorkBuddy 积分低于这个值就不再往那切
   workbuddyMinCredits: 50,
+  // 最后一档：按 token 计费的 DeepSeek 账号
+  deepseekFallback: { provider: 'deepseek-account', model: 'deepseek-flash' },
   // 兜底：1M 上下文里最便宜的 deepseek-v4-flash（系数 0.5）
   default: { provider: 'workbuddy', model: 'hy3' },
   longTextChars: 20000,
@@ -180,7 +184,14 @@ export function apply(ctx, config = {}) {
 
     const { text, attachments } = textOf(event.data ?? payload?.message)
     const choice = pickModel(text, { ...merged, attachments })
-    // 免费包余量不足时按 套餐 → WorkBuddy → 不切 的顺序降级。
+    // WorkBuddy（hy3 上下文很小）只在短会话用，长会话改走 1M 的包模型。
+    if (choice.provider === 'workbuddy' && (payload?.turn ?? 0) > (merged.workbuddyMaxTurn ?? 5)) {
+      choice.provider = 'ark-free-pack'
+      choice.model = 'deepseek-v4-flash-ga-260731'
+      choice.rule = `${choice.rule}-long-session`
+    }
+
+    // 免费包余量不足时按 WorkBuddy → 套餐 → DeepSeek 账号 → 不切 的顺序降级。
     if (choice.provider === 'ark-free-pack') {
       const coverage = packCoverage(choice.model, readSnapshot())
       if (coverage !== undefined && coverage <= 0) {
@@ -189,16 +200,22 @@ export function apply(ctx, config = {}) {
         const planOk = fiveHour ? fiveHour.percent < (merged.planCeilingPercent ?? 95) : true
         const credits = snap?.workbuddyCredits
         const creditsOk = typeof credits === 'number' ? credits >= (merged.workbuddyMinCredits ?? 50) : true
-        if (planOk) {
+        const canUseWorkbuddy = (payload?.turn ?? 0) <= (merged.workbuddyMaxTurn ?? 5)
+        if (canUseWorkbuddy && creditsOk) {
+          logger?.warn?.(`免费包 ${choice.model} 无余量，降级到 WorkBuddy ${merged.workbuddyFallback.model}`)
+          choice.provider = merged.workbuddyFallback.provider
+          choice.model = merged.workbuddyFallback.model
+          choice.rule = `${choice.rule}-pack-empty→workbuddy`
+        } else if (planOk) {
           logger?.warn?.(`免费包 ${choice.model} 无余量，降级到套餐 ${merged.planFallback.model}`)
           choice.provider = merged.planFallback.provider
           choice.model = merged.planFallback.model
           choice.rule = `${choice.rule}-pack-empty→plan`
-        } else if (creditsOk) {
-          logger?.warn?.(`免费包 ${choice.model} 无余量、套餐也快满，降级到 ${merged.workbuddyFallback.model}`)
-          choice.provider = merged.workbuddyFallback.provider
-          choice.model = merged.workbuddyFallback.model
-          choice.rule = `${choice.rule}-pack-empty→workbuddy`
+        } else if (merged.deepseekFallback?.provider) {
+          logger?.warn?.('包与套餐都不可用，最后才走 DeepSeek 账号（按 token 计费）')
+          choice.provider = merged.deepseekFallback.provider
+          choice.model = merged.deepseekFallback.model
+          choice.rule = `${choice.rule}-pack-empty→deepseek`
         } else {
           logger?.warn?.('免费包无余量、套餐与 WorkBuddy 都不可用，保持当前模型不动')
           return
