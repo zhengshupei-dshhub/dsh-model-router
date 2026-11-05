@@ -60,6 +60,10 @@ export const DEFAULTS = {
   workbuddyMinCredits: 50,
   // 降级第三档：按 token 计费的 DeepSeek 账号
   deepseekFallback: { provider: 'deepseek-account', model: 'deepseek-flash' },
+  // 套餐请求失败（订阅抖动 / 5xx）时，自动切到 DeepSeek 账号并重试同一轮
+  fallbackOnError: true,
+  // 命中这些错误才兜底（套餐端点抖动为主）
+  fallbackErrorPattern: 'InvalidSubscription|InternalServiceError|5\\d\\d|429|ServiceUnavailable',
   // 快照超过这么多分钟没更新就视为「未知」：宁可走套餐（最多 429），也不倒向按量计费
   snapshotStaleMinutes: 60,
   // 超过这个字符数直接上 1M 上下文的模型
@@ -227,5 +231,34 @@ export function apply(ctx, config = {}) {
     Promise.resolve()
       .then(() => ctx.sessionController.selectModel({ sessionId, provider: choice.provider, model: choice.model }))
       .catch((error) => logger?.warn?.(`选模型失败：${error?.message ?? error}`))
+  })
+
+  // 套餐端点抖动（InvalidSubscription / 5xx）时：切到 DeepSeek 账号并重试同一轮。
+  // 每个会话每轮只兜底一次，避免死循环把重试次数烧光。
+  const degradedTurn = new Map()
+
+  ctx.on('agent/request-error', async (payload, next) => {
+    try {
+      if (!merged.fallbackOnError) return next()
+      const provider = payload?.provider
+      if (provider !== PROVIDER) return next()
+      const sessionId = payload?.agent?.id
+      const turn = payload?.turn ?? 0
+      if (!sessionId || degradedTurn.get(sessionId) === turn) return next()
+
+      const failure = payload?.failure ?? {}
+      const text = `${failure.code ?? ''} ${failure.message ?? ''}`
+      const pattern = new RegExp(merged.fallbackErrorPattern ?? DEFAULTS.fallbackErrorPattern, 'i')
+      if (!pattern.test(text)) return next()
+
+      degradedTurn.set(sessionId, turn)
+      const target = merged.deepseekFallback
+      await ctx.sessionController.selectModel({ sessionId, provider: target.provider, model: target.model })
+      logger?.warn?.(`套餐请求失败（${failure.code ?? failure.status ?? '?'}），已切到 ${target.provider}/${target.model} 并重试`)
+      return { kind: 'retry' }
+    } catch (error) {
+      logger?.warn?.(`兜底切换失败：${error?.message ?? error}`)
+      return next()
+    }
   })
 }
