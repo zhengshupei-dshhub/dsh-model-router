@@ -50,64 +50,72 @@ const DEFAULTS = {
     'doubao-seed-2-1-lite-260915': 'doubao-seed-evolving-latest-version',
   },
   // 兜底：1M 上下文里最便宜的 deepseek-v4-flash（系数 0.5）
-  default: { provider: 'workbuddy', model: 'hy3' },
+  default: { provider: 'ark-agent-plan', model: 'deepseek-v4-flash-260801' },
+  // 套餐 5h 快满时，套餐模型 → 免费包等价物
+  planToPack: {
+    'kimi-k3-260701': 'kimi-k3-1-pro-261024',
+    'deepseek-v4-flash-260801': 'deepseek-v4-flash-ga-260731',
+    'glm-5-3-260801': 'glm-5-2-260617',
+    'glm-5-3-flash-260901': 'glm-5-3-flash-260828',
+    'doubao-seed-evolving-latest-version': 'doubao-seed-2-1-pro-260915',
+  },
   longTextChars: 20000,
   rules: [
     // 1) 硬推理：数学 / 算法 / 证明 / 复杂逻辑
     {
       id: 'reasoning',
       match: ['数学', '算法', '证明', '证一下', '推导', '不等式', '逻辑证明', '复杂度', '最优解', '递推', '方程', '归纳法'],
-      provider: 'ark-free-pack',
-      model: 'deepseek-v4-pro-ga-260813',
+      provider: 'ark-agent-plan',
+      model: 'deepseek-v4-flash-260801',
     },
     // 2) 单文件小改 / 补测试 / 样板代码
     {
       id: 'code-small',
       match: ['单文件', '小改', '补测试', '改个 bug', '修一个小 bug', '补个函数', '写个脚本', '样板', '改一下'],
-      provider: 'ark-free-pack',
-      model: 'deepseek-v4-flash-ga-260731',
+      provider: 'ark-agent-plan',
+      model: 'deepseek-v4-flash-260801',
     },
     // 3) 跨文件重构、架构设计、疑难 bug
     {
       id: 'code',
       match: ['重构', '架构', '疑难', '调试', '报错', '多文件', '跨文件', '整个项目', '依赖冲突', '设计模式'],
-      provider: 'ark-free-pack',
-      model: 'kimi-k3-1-pro-261024',
+      provider: 'ark-agent-plan',
+      model: 'kimi-k3-260701',
     },
     // 4) 代码审查 / 独立调查
     {
       id: 'review',
       match: ['审查', 'review', '排查', '调查', '审计', '评审', '检查一下'],
-      provider: 'ark-free-pack',
-      model: 'kimi-k3-1-pro-261024',
+      provider: 'ark-agent-plan',
+      model: 'kimi-k3-260701',
     },
     // 5) 长文档 / 论文 / 大代码库通读
     {
       id: 'long-doc',
       match: ['长文档', '通读', '整篇', '论文', 'pdf', '翻译整篇', '代码库', '大文件', '整本书', '全文'],
-      provider: 'ark-free-pack',
-      model: 'kimi-k3-1-pro-261024',
+      provider: 'ark-agent-plan',
+      model: 'kimi-k3-260701',
     },
     // 6) 看图 / 截图 / 视频理解
     {
       id: 'vision',
       match: ['截图', '看图', '图片', '照片', '这张图', '视频里', '识别一下', 'ocr', '这张'],
-      provider: 'ark-free-pack',
-      model: 'kimi-k3-1-pro-261024',
+      provider: 'ark-agent-plan',
+      model: 'kimi-k3-260701',
     },
     // 7) 中文文案 / 剧本 / 创意写作 —— GLM（订阅制，不另计费）
     {
       id: 'writing',
       match: ['文案', '剧本', '故事', '润色', '写一篇', '创作', '标题党', '小红书', '公众号', '口播'],
-      provider: 'ark-free-pack',
-      model: 'glm-5-2-260617',
+      provider: 'ark-agent-plan',
+      model: 'glm-5-3-260801',
     },
     // 8) 格式转换 / 抽取 / 分类 / 批量改写 —— 优先 WorkBuddy 免费模型（0 积分）
     {
       id: 'light',
       match: ['格式转换', '提取', '分类', '重命名', '列一下', '改写标题', '批量', '转成', 'json', 'csv', '表格'],
-      provider: 'workbuddy',
-      model: 'hy3',
+      provider: 'ark-agent-plan',
+      model: 'deepseek-v4-flash-260801',
     },
   ],
 }
@@ -196,51 +204,68 @@ export function apply(ctx, config = {}) {
 
     const { text, attachments } = textOf(event.data ?? payload?.message)
     const choice = pickModel(text, { ...merged, attachments })
-    // 平台端点被拦（欠费/未开通）时，包里模型一律改走套餐等价物。
-    if (choice.provider === 'ark-free-pack' && readSnapshot()?.packBlocked) {
-      const alt = merged.packToPlan?.[choice.model]
-      if (alt) {
-        logger?.warn?.(`平台端点被拦，${choice.model} → 套餐 ${alt}`)
-        choice.provider = 'ark-agent-plan'
+    // ── 套餐优先：额度足就走套餐；不足依次降级 免费包 → WorkBuddy → DeepSeek → 不动
+    const snap = readSnapshot()
+    const fiveHour = (snap?.planPeriods ?? []).find((p) => p.label === '5h')
+    const planOk = fiveHour ? fiveHour.percent < (merged.planCeilingPercent ?? 95) : true
+    const credits = snap?.workbuddyCredits
+    const creditsOk = typeof credits === 'number' ? credits >= (merged.workbuddyMinCredits ?? 50) : true
+    const canUseWorkbuddy = (payload?.turn ?? 0) <= (merged.workbuddyMaxTurn ?? 5)
+
+    // WorkBuddy 目标：长会话一律绕开（hy3 上下文小）。
+    if (choice.provider === 'workbuddy' && !canUseWorkbuddy) {
+      choice.provider = 'ark-agent-plan'
+      choice.model = 'deepseek-v4-flash-260801'
+      choice.rule = `${choice.rule}-long-session→plan`
+    }
+
+    // 套餐目标：额度不足时看包。
+    if (choice.provider === 'ark-agent-plan' && !planOk) {
+      const alt = merged.planToPack?.[choice.model]
+      const cov = alt ? packCoverage(alt, snap) : undefined
+      if (alt && !snap?.packBlocked && (cov === undefined || cov > 0)) {
+        logger?.warn?.(`套餐 5h 已用 ${fiveHour?.percent ?? '?'}%，${choice.model} → 免费包 ${alt}`)
+        choice.provider = 'ark-free-pack'
         choice.model = alt
-        choice.rule = `${choice.rule}-pack-blocked→plan`
+        choice.rule = `${choice.rule}-plan-full→pack`
+      } else if (canUseWorkbuddy && creditsOk) {
+        logger?.warn?.('套餐满且包不可用，降到 WorkBuddy')
+        choice.provider = merged.workbuddyFallback.provider
+        choice.model = merged.workbuddyFallback.model
+        choice.rule = `${choice.rule}-plan-full→workbuddy`
+      } else if (merged.deepseekFallback?.provider) {
+        logger?.warn?.('套餐满、包与 WorkBuddy 都不可用，最后走 DeepSeek 账号（按 token 计费）')
+        choice.provider = merged.deepseekFallback.provider
+        choice.model = merged.deepseekFallback.model
+        choice.rule = `${choice.rule}-plan-full→deepseek`
+      } else {
+        logger?.warn?.('所有额度都不可用，保持当前模型不动')
+        return
       }
     }
 
-    // WorkBuddy（hy3 上下文很小）只在短会话用，长会话改走 1M 的包模型。
-    if (choice.provider === 'workbuddy' && (payload?.turn ?? 0) > (merged.workbuddyMaxTurn ?? 5)) {
-      choice.provider = 'ark-free-pack'
-      choice.model = 'deepseek-v4-flash-ga-260731'
-      choice.rule = `${choice.rule}-long-session`
-    }
-
-    // 免费包余量不足时按 WorkBuddy → 套餐 → DeepSeek 账号 → 不切 的顺序降级。
+    // 免费包目标：包无余量或被拦时反向找套餐。
     if (choice.provider === 'ark-free-pack') {
-      const coverage = packCoverage(choice.model, readSnapshot())
-      if (coverage !== undefined && coverage <= 0) {
-        const snap = readSnapshot()
-        const fiveHour = (snap?.planPeriods ?? []).find((p) => p.label === '5h')
-        const planOk = fiveHour ? fiveHour.percent < (merged.planCeilingPercent ?? 95) : true
-        const credits = snap?.workbuddyCredits
-        const creditsOk = typeof credits === 'number' ? credits >= (merged.workbuddyMinCredits ?? 50) : true
-        const canUseWorkbuddy = (payload?.turn ?? 0) <= (merged.workbuddyMaxTurn ?? 5)
-        if (canUseWorkbuddy && creditsOk) {
-          logger?.warn?.(`免费包 ${choice.model} 无余量，降级到 WorkBuddy ${merged.workbuddyFallback.model}`)
+      const cov = packCoverage(choice.model, snap)
+      const blocked = Boolean(snap?.packBlocked)
+      if (blocked || (cov !== undefined && cov <= 0)) {
+        const alt = merged.packToPlan?.[choice.model]
+        if (alt && planOk) {
+          logger?.warn?.(`免费包 ${choice.model} ${blocked ? '被拦' : '无余量'} → 套餐 ${alt}`)
+          choice.provider = 'ark-agent-plan'
+          choice.model = alt
+          choice.rule = `${choice.rule}-pack-out→plan`
+        } else if (canUseWorkbuddy && creditsOk) {
+          logger?.warn?.(`免费包 ${choice.model} 不可用，降到 WorkBuddy`)
           choice.provider = merged.workbuddyFallback.provider
           choice.model = merged.workbuddyFallback.model
-          choice.rule = `${choice.rule}-pack-empty→workbuddy`
-        } else if (planOk) {
-          logger?.warn?.(`免费包 ${choice.model} 无余量，降级到套餐 ${merged.planFallback.model}`)
-          choice.provider = merged.planFallback.provider
-          choice.model = merged.planFallback.model
-          choice.rule = `${choice.rule}-pack-empty→plan`
+          choice.rule = `${choice.rule}-pack-out→workbuddy`
         } else if (merged.deepseekFallback?.provider) {
-          logger?.warn?.('包与套餐都不可用，最后才走 DeepSeek 账号（按 token 计费）')
+          logger?.warn?.('包不可用且套餐也满，最后走 DeepSeek 账号')
           choice.provider = merged.deepseekFallback.provider
           choice.model = merged.deepseekFallback.model
-          choice.rule = `${choice.rule}-pack-empty→deepseek`
+          choice.rule = `${choice.rule}-pack-out→deepseek`
         } else {
-          logger?.warn?.('免费包无余量、套餐与 WorkBuddy 都不可用，保持当前模型不动')
           return
         }
       }
