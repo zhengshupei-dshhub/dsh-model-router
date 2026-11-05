@@ -37,6 +37,18 @@ const DEFAULTS = {
   workbuddyMinCredits: 50,
   // 最后一档：按 token 计费的 DeepSeek 账号
   deepseekFallback: { provider: 'deepseek-account', model: 'deepseek-flash' },
+  // 平台端点被拦（欠费/未开通）时，免费包模型对应的套餐替代
+  packToPlan: {
+    'kimi-k3-1-pro-261024': 'kimi-k3-260701',
+    'deepseek-v4-pro-ga-260813': 'deepseek-v4-flash-260801',
+    'deepseek-v4-flash-ga-260731': 'deepseek-v4-flash-260801',
+    'deepseek-v4-1-flash-261017': 'deepseek-v4-flash-260801',
+    'deepseek-v4-1-flash-economy-261017': 'deepseek-v4-flash-260801',
+    'glm-5-2-260617': 'glm-5-3-260801',
+    'glm-5-3-flash-260828': 'glm-5-3-flash-260901',
+    'doubao-seed-2-1-pro-260915': 'doubao-seed-evolving-latest-version',
+    'doubao-seed-2-1-lite-260915': 'doubao-seed-evolving-latest-version',
+  },
   // 兜底：1M 上下文里最便宜的 deepseek-v4-flash（系数 0.5）
   default: { provider: 'workbuddy', model: 'hy3' },
   longTextChars: 20000,
@@ -184,6 +196,17 @@ export function apply(ctx, config = {}) {
 
     const { text, attachments } = textOf(event.data ?? payload?.message)
     const choice = pickModel(text, { ...merged, attachments })
+    // 平台端点被拦（欠费/未开通）时，包里模型一律改走套餐等价物。
+    if (choice.provider === 'ark-free-pack' && readSnapshot()?.packBlocked) {
+      const alt = merged.packToPlan?.[choice.model]
+      if (alt) {
+        logger?.warn?.(`平台端点被拦，${choice.model} → 套餐 ${alt}`)
+        choice.provider = 'ark-agent-plan'
+        choice.model = alt
+        choice.rule = `${choice.rule}-pack-blocked→plan`
+      }
+    }
+
     // WorkBuddy（hy3 上下文很小）只在短会话用，长会话改走 1M 的包模型。
     if (choice.provider === 'workbuddy' && (payload?.turn ?? 0) > (merged.workbuddyMaxTurn ?? 5)) {
       choice.provider = 'ark-free-pack'
