@@ -26,6 +26,13 @@ const DEFAULTS = {
   enabled: true,
   // 是否每一轮用户消息都重新选模型（默认只在会话第一轮选一次）
   perTurn: false,
+  // 免费包用尽后的降级顺序：先用套餐（订阅额度），再退 WorkBuddy（积分），都没有就不切
+  planFallback: { provider: 'ark-agent-plan', model: 'deepseek-v4-flash-260801' },
+  workbuddyFallback: { provider: 'workbuddy', model: 'hy3' },
+  // 套餐 5 小时窗口用到这个百分比就算「不可用」
+  planCeilingPercent: 95,
+  // WorkBuddy 积分低于这个值就不再往那切
+  workbuddyMinCredits: 50,
   // 兜底：1M 上下文里最便宜的 deepseek-v4-flash（系数 0.5）
   default: { provider: 'workbuddy', model: 'hy3' },
   longTextChars: 20000,
@@ -173,14 +180,29 @@ export function apply(ctx, config = {}) {
 
     const { text, attachments } = textOf(event.data ?? payload?.message)
     const choice = pickModel(text, { ...merged, attachments })
-    // 免费包余量不足时，不要往这个模型上切（包耗尽后平台端点会转扣账户余额）。
+    // 免费包余量不足时按 套餐 → WorkBuddy → 不切 的顺序降级。
     if (choice.provider === 'ark-free-pack') {
       const coverage = packCoverage(choice.model, readSnapshot())
       if (coverage !== undefined && coverage <= 0) {
-        logger?.warn?.(`免费包 ${choice.model} 已无余量，退回 workbuddy/hy3`)
-        choice.provider = merged.fallback?.provider ?? 'workbuddy'
-        choice.model = merged.fallback?.model ?? 'hy3'
-        choice.rule = `${choice.rule}-pack-empty`
+        const snap = readSnapshot()
+        const fiveHour = (snap?.planPeriods ?? []).find((p) => p.label === '5h')
+        const planOk = fiveHour ? fiveHour.percent < (merged.planCeilingPercent ?? 95) : true
+        const credits = snap?.workbuddyCredits
+        const creditsOk = typeof credits === 'number' ? credits >= (merged.workbuddyMinCredits ?? 50) : true
+        if (planOk) {
+          logger?.warn?.(`免费包 ${choice.model} 无余量，降级到套餐 ${merged.planFallback.model}`)
+          choice.provider = merged.planFallback.provider
+          choice.model = merged.planFallback.model
+          choice.rule = `${choice.rule}-pack-empty→plan`
+        } else if (creditsOk) {
+          logger?.warn?.(`免费包 ${choice.model} 无余量、套餐也快满，降级到 ${merged.workbuddyFallback.model}`)
+          choice.provider = merged.workbuddyFallback.provider
+          choice.model = merged.workbuddyFallback.model
+          choice.rule = `${choice.rule}-pack-empty→workbuddy`
+        } else {
+          logger?.warn?.('免费包无余量、套餐与 WorkBuddy 都不可用，保持当前模型不动')
+          return
+        }
       }
     }
     logger?.info?.(`开局选模型：session=${sessionId} rule=${choice.rule} → ${choice.provider}/${choice.model}`)
