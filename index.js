@@ -12,6 +12,7 @@
  * - 任何一步失败都只写日志，不影响正常对话。
  */
 
+import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -19,10 +20,29 @@ import path from 'node:path'
 export const inject = ['sessionController']
 
 function readSnapshot() {
+  const file = path.join(os.homedir(), '.dsh', 'quota-snapshot.json')
   try {
-    return JSON.parse(fs.readFileSync(path.join(os.homedir(), '.dsh', 'quota-snapshot.json'), 'utf8'))
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'))
+    const ageMs = Date.now() - (Date.parse(data.checkedAt) || 0)
+    return { data, ageMs }
   } catch {
     return undefined
+  }
+}
+
+/** 快照太旧就在后台刷一次（有冷却，避免每条消息都拉起来）。 */
+let lastRefreshAt = 0
+function refreshSnapshotInBackground(logger) {
+  const now = Date.now()
+  if (now - lastRefreshAt < 10 * 60_000) return
+  lastRefreshAt = now
+  try {
+    const script = path.join(os.homedir(), 'DeepSeekHarness', 'dsh-automation', 'quota-guard', 'check.mjs')
+    if (!fs.existsSync(script)) return
+    const child = spawn(process.execPath, [script], { detached: true, stdio: 'ignore' })
+    child.unref()
+  } catch (error) {
+    logger?.warn?.(`刷新余量快照失败：${error?.message ?? error}`)
   }
 }
 
@@ -40,6 +60,8 @@ export const DEFAULTS = {
   workbuddyMinCredits: 50,
   // 降级第三档：按 token 计费的 DeepSeek 账号
   deepseekFallback: { provider: 'deepseek-account', model: 'deepseek-flash' },
+  // 快照超过这么多分钟没更新就视为「未知」：宁可走套餐（最多 429），也不倒向按量计费
+  snapshotStaleMinutes: 60,
   // 超过这个字符数直接上 1M 上下文的模型
   longTextChars: 20000,
   default: { provider: PROVIDER, model: 'doubao-seed-2.1-pro' },
@@ -159,9 +181,14 @@ export function apply(ctx, config = {}) {
     const { text, attachments } = textOf(payload?.message)
     const choice = pickModel(text, { ...merged, attachments })
 
-    const snap = readSnapshot()
+    const snapshot = readSnapshot()
+    const stale = !snapshot || snapshot.ageMs > (merged.snapshotStaleMinutes ?? 60) * 60_000
+    if (stale) refreshSnapshotInBackground(logger)
+    const snap = snapshot?.data
     const fiveHour = (snap?.planPeriods ?? []).find((p) => p.label === '5h')
-    const planOk = fiveHour ? fiveHour.percent < (merged.planCeilingPercent ?? 95) : true
+    // 快照过期时按「套餐可用」处理：误判的代价是 429（免费），
+    // 反过来误判会直接切到按量计费的 DeepSeek 账号。
+    const planOk = stale || !fiveHour ? true : fiveHour.percent < (merged.planCeilingPercent ?? 95)
     const credits = snap?.workbuddyCredits
     const creditsOk = typeof credits === 'number' ? credits >= (merged.workbuddyMinCredits ?? 50) : true
     const canUseWorkbuddy = turn <= (merged.workbuddyMaxTurn ?? 5)
