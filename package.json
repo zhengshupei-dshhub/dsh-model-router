@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-model-router",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "private": true,
   "type": "module",
   "description": "开局选模型：按任务关键词自动切换最合适的模型，provider 与模型映射均可配置",

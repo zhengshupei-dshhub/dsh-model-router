@@ -141,6 +141,20 @@ function matchesName(entry, words) {
   return words.some((word) => name.includes(word.toLowerCase()))
 }
 
+/** 挑视觉模型：显式 vision 命名 > 强档(pro/max/ultra) > 非轻量档 > 第一个多模态。
+ *  2026-11-06：原来取「第一个多模态」，结果 deepseek-flash（也是多模态、且是当前模型）
+ *  被选中，看起来像"没切换"。强档优先能真正切到 doubao/kimi 这类专门的视觉模型。 */
+function pickVision(list) {
+  const multimodal = list.filter(isMultimodal)
+  if (!multimodal.length) return undefined
+  return (
+    multimodal.find((entry) => matchesName(entry, NAME_HINTS.vision)) ??
+    multimodal.find((entry) => matchesName(entry, ['pro', 'max', 'ultra'])) ??
+    multimodal.find((entry) => !matchesName(entry, NAME_HINTS.light)) ??
+    multimodal[0]
+  )
+}
+
 function isMultimodal(entry) {
   if ((entry.modalities ?? []).some((modality) => modality === 'image')) return true
   return matchesName(entry, NAME_HINTS.vision)
@@ -162,7 +176,7 @@ export function discoverModelMap(catalog) {
   }
 
   // 视觉：优先用显式标注 image 的，其次名字带 vision/vl 的
-  assign('vision', list.find(isMultimodal))
+  assign('vision', pickVision(list))
 
   // 轻量/小改：名字带 mini/lite/flash 的
   assign('light', findByName(NAME_HINTS.light))
